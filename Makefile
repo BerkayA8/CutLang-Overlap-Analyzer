@@ -51,7 +51,7 @@ BISON_SRC := $(ADL_DIR)/parser.y
 FLEX_SRC  := $(ADL_DIR)/scanner.l
 
 # Generated parser files (written back into adl/)
-BISON_OUT := $(ADL_DIR)/Parser.cpp $(ADL_DIR)/Parser.h
+BISON_OUT := $(ADL_DIR)/Parser.cpp $(ADL_DIR)/Parser.h $(ADL_DIR)/location.hh
 FLEX_OUT  := $(ADL_DIR)/Scanner.cpp
 
 # ── C++ sources ───────────────────────────────────────────────────────────────
@@ -107,13 +107,13 @@ all: $(TARGET)
 parser: $(ADL_DIR)/Parser.cpp $(ADL_DIR)/Parser.h $(ADL_DIR)/Scanner.cpp
 
 $(ADL_DIR)/Parser.cpp $(ADL_DIR)/Parser.h: $(BISON_SRC)
-	$(BISON) --defines=$(ADL_DIR)/Parser.h --output=$(ADL_DIR)/Parser.cpp $(BISON_SRC)
+	cd $(ADL_DIR) && $(BISON) --defines=Parser.h --output=Parser.cpp parser.y
 
 # =============================================================================
 # Step 2 — Generate Scanner.cpp from adl/scanner.l  (flex)
 # =============================================================================
 $(ADL_DIR)/Scanner.cpp: $(FLEX_SRC)
-	$(FLEX) --outfile=$(ADL_DIR)/Scanner.cpp $(FLEX_SRC)
+	cd $(ADL_DIR) && $(FLEX) --outfile=Scanner.cpp scanner.l
 
 # =============================================================================
 # Step 3 — Compile & link → Overlap_pipeline/adl_to_json
@@ -139,12 +139,15 @@ check: $(TARGET)
 # =============================================================================
 .PHONY: run
 run: $(TARGET)
+	@$(PYTHON) -c "import sys; v=sys.version_info; \
+	    (print('ERROR: Python 3.12 or later is required (you have {}.{}.{})'.format(v.major, v.minor, v.micro)) \
+	    or sys.exit(1)) if (v.major, v.minor) < (3, 12) else None"
 	@if [ -z "$(ADLS)" ]; then \
 	    echo "ERROR: specify at least two ADL files."; \
 	    echo "  make run ADLS=\"a.adl b.adl\""; \
 	    exit 1; \
 	fi
-	$(PYTHON) $(OVERLAP) $(ADLS) $(_FLAGS)
+	-$(PYTHON) $(OVERLAP) $(ADLS) $(_FLAGS)
 
 # =============================================================================
 # Clean
@@ -154,10 +157,6 @@ clean:
 	rm -f $(TARGET) $(BISON_OUT) $(FLEX_OUT)
 	@echo "Cleaned generated parser files and binary."
 
-.PHONY: distclean
-distclean: clean
-	rm -f $(PIPELINE_DIR)/*.html
-	@echo "Removed HTML reports."
 
 # =============================================================================
 # Help

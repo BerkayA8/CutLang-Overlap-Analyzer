@@ -2,7 +2,7 @@
 
 ## Building
 
-Make sure `g++` (C++17), `bison` (3.x), `flex`, and `python3` are installed, then run `make` from the project root:
+Make sure `g++` (C++17), `bison` (3.x), `flex`, and `python3` (3.12+) are installed, then run `make` from the project root:
 
 ```bash
 make
@@ -63,7 +63,7 @@ If you prefer to bypass `make run`:
 python3 Overlap_pipeline/adl_overlap_check.py a.adl b.adl
 python3 Overlap_pipeline/adl_overlap_check.py a.adl b.adl --html report.html
 python3 Overlap_pipeline/adl_overlap_check.py a.adl b.adl --verbose --catalogue
-python3 Overlap_pipeline/adl_overlap_check.py *.adl --regions --html out.html
+python3 Overlap_pipeline/adl_overlap_check.py *.adl --html out.html
 ```
 
 The binary `Overlap_pipeline/adl_to_json` is found automatically when the script runs from the same directory. If you move the binary, point to it with:
