@@ -116,14 +116,20 @@ def render_terminal(reports: List[OverlapReport], verbose: bool = True) -> str:
                     for cp in matched:
                         sa = ", ".join(sorted(cp.surface_a)) or "?"
                         sb = ", ".join(sorted(cp.surface_b)) or "?"
-                        lines.append(f"      {CYAN}{sa}{RESET}  ↔  {CYAN}{sb}{RESET}  {_verdict_str(cp.verdict)}")
+                        oa = f" {GREY}[{_origin_text(cp.origin_a)}]{RESET}" if cp.origin_a else ""
+                        ob = f" {GREY}[{_origin_text(cp.origin_b)}]{RESET}" if cp.origin_b else ""
+                        lines.append(f"      {CYAN}{sa}{RESET}{oa}  ↔  {CYAN}{sb}{RESET}{ob}  {_verdict_str(cp.verdict)}")
                         for vo in cp.variable_overlaps:
                             _append_var_row(lines, vo, indent=8)
                 if unmatched:
                     lines.append(f"    {GREY}{len(unmatched)} cut(s) with no structural match (skipped):{RESET}")
                     for cp in unmatched:
-                        sa = ", ".join(sorted(cp.surface_a)) or "?"
-                        lines.append(f"      {GREY}{sa}{RESET}")
+                        side = "A" if (cp.surface_a or cp.tree_a is not None) else "B"
+                        surf = cp.surface_a if side == "A" else cp.surface_b
+                        origin = cp.origin_a if side == "A" else cp.origin_b
+                        sa = ", ".join(sorted(surf)) or "?"
+                        otag = f" [{_origin_text(origin)}]" if origin else ""
+                        lines.append(f"      {GREY}{side}: {sa}{otag}  → {cp.verdict}{RESET}")
                 for n in reg.notes:
                     lines.append(f"    {GREY}↳ {n}{RESET}")
 
@@ -215,6 +221,8 @@ details[open] summary::before{content:"▼  "}
 .dep-tree-pane{background:var(--surf3);border-radius:5px;padding:.5rem .7rem;
                overflow-x:auto}
 .note{color:var(--muted);font-size:.75rem;font-style:italic;padding:.1rem 0}
+.note-warn{color:var(--yellow);font-size:.75rem;padding:.1rem 0}
+.origin-tag{font-family:'JetBrains Mono',monospace;font-size:.66rem;color:var(--purple);border:1px solid var(--purple);border-radius:3px;padding:0 .3rem;margin-left:.35rem;opacity:.85;white-space:nowrap}
 .builtin-tag{background:#79c0ff15;color:var(--blue);padding:.1rem .3rem;
              border-radius:3px;font-size:.68rem;font-family:'JetBrains Mono',monospace}
 .unmatched-row td{opacity:.45}
@@ -328,9 +336,26 @@ def _var_table_html(var_overlaps: List[VariableOverlap]) -> str:
     )
 
 
+def _origin_text(origin) -> str:
+    """``("init", "presel")`` → ``"from init → presel"``; ``()`` → ``""``."""
+    return f"from {' → '.join(origin)}" if origin else ""
+
+
+def _origin_html(origin) -> str:
+    t = _origin_text(origin)
+    return f'<span class="origin-tag">{t}</span>' if t else ""
+
+
+def _note_html(n: str) -> str:
+    cls = "note-warn" if "⚠" in n else "note"
+    return f'<div class="{cls}">↳ {n}</div>'
+
+
 def _cut_pair_html(cp: CutPairResult) -> str:
     sa = ", ".join(sorted(cp.surface_a)) or "—"
     sb = ", ".join(sorted(cp.surface_b)) or "—"
+    oa = _origin_html(cp.origin_a)
+    ob = _origin_html(cp.origin_b)
 
     if not cp.structure_matched:
         # Unmatched cut pair — present only in one of the two ADLs.
@@ -354,12 +379,12 @@ def _cut_pair_html(cp: CutPairResult) -> str:
             else (sb if cp.surface_b else None)
         )
         a_html = (
-            f'<span class="cut-content">{a_label}</span>'
+            f'<span class="cut-content">{a_label}</span>{oa}'
             if a_label
             else '<span class="cut-missing">(no matching cut in A)</span>'
         )
         b_html = (
-            f'<span class="cut-content">{b_label}</span>'
+            f'<span class="cut-content">{b_label}</span>{ob}'
             if b_label
             else '<span class="cut-missing">(no matching cut in B)</span>'
         )
@@ -387,8 +412,11 @@ def _cut_pair_html(cp: CutPairResult) -> str:
             f'{_tag(tag_value)}'
             f'</div>{notes_html}'
             f'<div style="color:var(--muted);font-size:.7rem;margin-top:.2rem">'
-            f'Cut present only in one ADL — no structural counterpart on the other side.'
-            f'</div>'
+            + ('Region reference that cannot be modelled — treated as OVERLAP '
+               '(never yields a false DISJOINT or EQUAL).'
+               if cp.opaque_region_ref else
+               'Cut present only in one ADL — no structural counterpart on the other side.')
+            + f'</div>'
             f'</div>'
         )
     if not cp.dep_values_matched:
@@ -397,7 +425,7 @@ def _cut_pair_html(cp: CutPairResult) -> str:
         return (
             f'<div class="cut-pair-block" style="opacity:.55">'
             f'<div class="cut-pair-header">'
-            f'<span class="surface-label">{sa}  ↔  {sb2}</span>'
+            f'<span class="surface-label">{sa}{oa}  ↔  {sb2}{ob}</span>'
             f'<span style="color:var(--yellow);font-size:.72rem;font-weight:600">'
             f'= struct match  ≠ dep values differ</span>'
             f'</div>{notes_html2}'
@@ -435,7 +463,7 @@ def _cut_pair_html(cp: CutPairResult) -> str:
     return (
         f'<div class="cut-pair-block">'
         f'<div class="cut-pair-header">'
-        f'<span class="surface-label">{sa}  ↔  {sb}</span>'
+        f'<span class="surface-label">{sa}{oa}  ↔  {sb}{ob}</span>'
         f'<span>{match_badge}  {_tag(cp.verdict)}</span>'
         f'</div>'
         f'{notes_html}{var_section}{tree_section}'
@@ -471,8 +499,9 @@ def render_html(reports: List[OverlapReport], catalogues: List[AnalysisCatalogue
                 notes_html = "".join(
                     f'<div class="note">↳ {n}</div>' for n in obj.notes
                 )
+                row_class = '  class="unmatched-row"' if not obj.structure_matched else ''
                 obj_rows += (
-                    f"<tr{'  class=\"unmatched-row\"' if not obj.structure_matched else ''}>"
+                    f"<tr{row_class}>"
                     f"<td><strong>{obj.object_a}</strong>"
                     f'<br><span style="color:var(--muted);font-size:.72rem">{obj.chain_a}</span></td>'
                     f"<td><strong>{obj.object_b}</strong>"
@@ -514,7 +543,7 @@ def render_html(reports: List[OverlapReport], catalogues: List[AnalysisCatalogue
                 f"{cp_html}</details>"
             )
 
-            notes_html = "".join(f'<div class="note">↳ {n}</div>' for n in reg.notes)
+            notes_html = "".join(_note_html(n) for n in reg.notes)
             reg_rows += (
                 f"<tr>"
                 f"<td><strong>{reg.region_a}</strong></td>"

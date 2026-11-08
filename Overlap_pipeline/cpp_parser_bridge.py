@@ -124,11 +124,7 @@ def parse_adl_file_cpp(adl_path: str) -> List[dict]:
             "the ADL_TO_JSON environment variable."
         )
 
-    # The C++ Driver constructor searches for an adl/ subdirectory starting
-    # from the current working directory.  When parsing temp files (e.g. from
-    # parse_adl_text_cpp), the cwd may be unrelated to the binary location.
-    # Fix: always run the binary with cwd set to its own directory, and pass
-    # the ADL file as an absolute path so it can still be found.
+
     binary_dir = os.path.dirname(os.path.abspath(binary))
     abs_adl_path = os.path.abspath(adl_path)
 

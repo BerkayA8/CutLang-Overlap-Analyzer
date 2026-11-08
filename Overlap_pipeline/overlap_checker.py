@@ -58,7 +58,8 @@ from ir_extractor import (
     CutStructure,
     ConstraintExpr, ConstraintLeaf, ConstraintAnd, ConstraintOr,
     constraint_expr_leaves,
-    ObjectInheritanceChain, CutDependency,
+    CutDependency, CutRootDependency, DefineDependency,
+    BuiltinDependency, ObjectDependency,
     BUILTIN_OBJECTS, canonicalise,
 )
 from expr_node import compare_expr
@@ -568,6 +569,14 @@ class CutPairResult:
     # whose underlying sub-collections are disjoint — see the rule in
     # ``_compare_region_variables``.
     informational_only: bool = False
+    # Region-inheritance provenance of each side's cut: ``()`` for the
+    # region's own cut, ``("presel",)`` for a cut inherited from presel,
+    # ``("init", "presel")`` for one owned by init and reached via presel.
+    origin_a: Tuple[str, ...] = ()
+    origin_b: Tuple[str, ...] = ()
+    # True for an unmodellable region-reference line (see
+    # ``_collect_opaque_region_cuts``) — lets the report label it properly.
+    opaque_region_ref: bool = False
 
 
 @dataclass
@@ -701,152 +710,227 @@ def _group_by_func_chain(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Object-chain cumulative-cut comparison
+# Object structural comparison
 # ─────────────────────────────────────────────────────────────────────────────
+# ObjectDependency absorbs what the old (removed) ObjectInheritanceChain
+# used to do: .roots() (plural — fixes the old scalar-root bug for Union
+# objects) and .cumulative_constraint_expr() (ANDs an object's own cuts with
+# the OR of every parent branch's cumulative constraints — the actual
+# set-membership semantics of a Union object, used by ir_extractor and its
+# own tests). But that flattened, OR'd expression is NOT safe to feed
+# through the per-axis IntervalSet evaluator for COMPARISON purposes once an
+# object has more than one branch with DIFFERENT roots (a genuine Union,
+# e.g. ``leptons = Union(electrons, muons)``):
+#
+#   BUG (fixed below): the old comparator flattened every leaf from every
+#   branch into one collection-agnostic func_chain bucket, picked ONE
+#   representative leaf's signature as "the" axis (e.g. pT(ELE)), and
+#   evaluated the *entire* OR'd expression against that single axis. The
+#   other branch (muons) has no leaf matching that axis, so it evaluates to
+#   "everything" on it — and "everything" unioned into an OR swallows the
+#   whole expression to "everything" on that axis, on BOTH sides being
+#   compared. Two ``leptons`` objects built from provably DISJOINT electron
+#   cuts (pT>20 vs pT<10) and DISJOINT muon cuts would each show
+#   "everything" on the pT(ELE) axis and misreport EQUAL, even though the
+#   union as a whole is genuinely disjoint.
+#
+# The fix: a Union's branches partition the object's acceptance set by
+# built-in root (an element can never satisfy two different roots at once —
+# an electron can't also be a muon), so the comparison must never mix leaves
+# from different roots into one axis bucket. Instead, for every root
+# reachable by EITHER side, build a per-root RESTRICTED cumulative
+# expression (own constraints AND-ed with only the parent branch(es) whose
+# root-set actually includes that root — see ``_restricted_cumulative``) and
+# compare those independently, combining the per-root verdicts with the
+# usual 5-value lattice. A root present on only one side means that side's
+# root-slice is the empty set (that object can never produce an element of
+# that type at all), which is trivially contained in whatever the other
+# side has there — see the "root present on only one side" branch below for
+# the direction this implies.
+#
+# A plain (non-Union, single-root) object degenerates to comparing exactly
+# one root-slice equal to its own ``cumulative_constraint_expr()`` — the
+# same behavior as before this fix. This is also the logic used for the
+# root-object comparison in the report (_check_object_pair_for_report) and
+# for object children embedded deeper in a cut's tree (_compare_dep_nodes),
+# which is why this single function serves both call sites.
 
-def _compare_object_chains(
-    chain_a: ObjectInheritanceChain,
-    chain_b: ObjectInheritanceChain,
+def _restricted_cumulative(node: CutDependency, root: str) -> ConstraintExpr:
+    """The portion of ``node``'s cumulative constraint that applies to
+    elements of built-in type ``root`` — like ``cumulative_constraint_expr()``
+    but DROPPING (rather than OR-ing in) any parent branch whose root-set
+    doesn't include ``root``.
+
+    This is the key difference from ``ObjectDependency.cumulative_constraint_expr()``:
+    that method ORs together the cumulative expressions of EVERY parent
+    branch, which is the correct SET-MEMBERSHIP semantics (an element
+    belongs to the union if it satisfies *any* branch) but is unsafe to
+    feed through the per-axis IntervalSet evaluator, since a branch that
+    doesn't reference the axis in question evaluates to "everything" and
+    poisons the OR. Restricting to one root first means every leaf that
+    survives genuinely shares that root's domain, so evaluating the result
+    per axis is safe.
+    """
+    if isinstance(node, BuiltinDependency):
+        return node.cumulative_constraint_expr()
+    if not isinstance(node, ObjectDependency):
+        return ConstraintAnd(())
+
+    own = ConstraintAnd(tuple(node.own_constraint_exprs)) if node.own_constraint_exprs else None
+    relevant = [ch for ch in node.children
+                if isinstance(ch, (ObjectDependency, BuiltinDependency))
+                and root in ch.roots()]
+    if not relevant:
+        branch_combined = None
+    elif len(relevant) == 1:
+        branch_combined = _restricted_cumulative(relevant[0], root)
+    else:
+        branch_combined = ConstraintOr(tuple(
+            _restricted_cumulative(ch, root) for ch in relevant
+        ))
+
+    parts = [p for p in (own, branch_combined) if p is not None]
+    if not parts:
+        return ConstraintAnd(())
+    if len(parts) == 1:
+        return parts[0]
+    return ConstraintAnd(tuple(parts))
+
+
+def _compare_object_subtrees(
+    obj_a: CutDependency, obj_b: CutDependency,
     var_overlaps_out: Optional[List[VariableOverlap]] = None,
 ) -> str:
     """
-    Compare two object inheritance chains by their cumulative cuts,
-    ignoring the split across named intermediate objects.
-    Returns DISJOINT / EQUAL / SUBSET / SUPERSET / OVERLAP.
+    Compare two ObjectDependency nodes root-slice by root-slice (see the
+    module comment above for why). Returns
+    DISJOINT / EQUAL / SUBSET / SUPERSET / OVERLAP.
     """
-    root_a = chain_a.root
-    root_b = chain_b.root
-
-    if root_a == "UNKNOWN" or root_b == "UNKNOWN":
-        return OVERLAP
-    if root_a != root_b:
+    if not isinstance(obj_a, ObjectDependency) or not isinstance(obj_b, ObjectDependency):
         return OVERLAP
 
-    cum_a = chain_a.cumulative_cuts()
-    cum_b = chain_b.cumulative_cuts()
-    groups_a = _group_by_func_chain(cum_a)
-    groups_b = _group_by_func_chain(cum_b)
+    roots_a = obj_a.roots()
+    roots_b = obj_b.roots()
+    if not roots_a or not roots_b or not (roots_a & roots_b):
+        return OVERLAP
 
-    # Structured forms — used to evaluate IntervalSets per axis with
-    # correct AND/OR semantics. The fallback intersect-flat-list path
-    # kicks in only for chains that haven't been populated with
-    # constraint_exprs (older code paths or constructed-by-hand chains).
-    exprs_a = chain_a.cumulative_constraint_exprs()
-    exprs_b = chain_b.cumulative_constraint_exprs()
+    # Root-slices combine via OR (an element belongs to the union if it's
+    # in ANY branch), which has different disjointness/containment algebra
+    # than the AND-combined axes within one slice. Concretely, for
+    # A = ⋃ᵣ Aᵣ and B = ⋃ᵣ Bᵣ over disjoint roots r (an electron can never
+    # also be a muon, so cross-root intersections are always empty):
+    #
+    #   A ∩ B = ⋃ᵣ (Aᵣ ∩ Bᵣ)   -- only COMMON roots can ever contribute
+    #
+    # so DISJOINT-overall requires *every* common root's slice to be
+    # disjoint — a root present on only one side contributes nothing to
+    # the intersection either way and can never by itself force or break
+    # DISJOINT. This is the opposite of ``_combine``'s "any DISJOINT wins"
+    # rule, which models AND-combined axes (there, one disjoint axis truly
+    # does make the whole conjunction unsatisfiable together). Reusing
+    # ``_combine`` across root-slices was exactly the mistake: it reported
+    # DISJOINT for two ``leptons`` objects whenever the ELECTRON slice was
+    # disjoint, even when their MUON slices were identical (genuinely
+    # overlapping) — the union clearly still shares those muons, so the
+    # correct verdict there is OVERLAP, not DISJOINT.
+    common_relations: List[str] = []
+    only_in_a = False
+    only_in_b = False
 
-    all_vars = set(groups_a) | set(groups_b)
-    contribs: List[str] = []
-
-    for var in sorted(all_vars):
-        in_a = var in groups_a
-        in_b = var in groups_b
+    for root in sorted(roots_a | roots_b):
+        in_a, in_b = root in roots_a, root in roots_b
         if in_a and in_b:
-            # The bucket key here is ``func_chain`` (collection-agnostic),
-            # not ``lhs.signature()``. To evaluate IntervalSets we need
-            # the per-axis (signature-based) decomposition. Use the
-            # representative leaf's signature as the axis identifier;
-            # this assumes all leaves grouped under the same func_chain
-            # also share lhs.signature() — true for simple cuts (where
-            # signature is essentially fn:func(id:coll|*)) and the
-            # behaviour we want for the cumulative-cuts comparison
-            # which only ever pairs same-root chains anyway.
-            axis_sig = groups_a[var][0].lhs.signature()
-            iv_a = evaluate_axis_for_exprs(exprs_a, axis_sig)
-            iv_b = evaluate_axis_for_exprs(exprs_b, axis_sig)
-            rel = _interval_set_relation(iv_a, iv_b)
-            contribs.append(rel)
-            if var_overlaps_out is not None:
-                disp = (groups_a.get(var) or groups_b.get(var))[0].display_name()
-                var_overlaps_out.append(VariableOverlap(
-                    variable=disp,
-                    interval_a=iv_a, interval_b=iv_b,
-                    intersection=iv_a.intersect(iv_b),
-                    relation=rel,
-                ))
-        elif in_a:
-            contribs.append(SUBSET)
-        else:
-            contribs.append(SUPERSET)
+            cum_a = _restricted_cumulative(obj_a, root)
+            cum_b = _restricted_cumulative(obj_b, root)
+            groups_a = _group_by_func_chain(constraint_expr_leaves(cum_a))
+            groups_b = _group_by_func_chain(constraint_expr_leaves(cum_b))
 
-    return _combine(contribs)
+            root_contribs: List[str] = []
+            for var in sorted(set(groups_a) | set(groups_b)):
+                va, vb = var in groups_a, var in groups_b
+                if va and vb:
+                    # A func_chain bucket (e.g. "dr") can hold MORE than
+                    # one distinct axis: ``dR(ELE, nonbjets)`` and
+                    # ``dR(ELE, jets)`` share the func_chain "dr" but are
+                    # different physical quantities once ``nonbjets`` and
+                    # ``jets`` are distinguished (see IdNode.src_object).
+                    # Taking only groups_a[var][0]'s signature — the old
+                    # behaviour — silently dropped every other axis in
+                    # the bucket from both the verdict and the report.
+                    # Evaluate every distinct signature seen on either
+                    # side instead; a side that doesn't reference a given
+                    # signature contributes "everything" on it (handled
+                    # by evaluate_axis_for_expr), which is the correct
+                    # "this side doesn't constrain that axis" semantics.
+                    sigs_a = {fc.lhs.signature(): fc for fc in groups_a[var]}
+                    sigs_b = {fc.lhs.signature(): fc for fc in groups_b[var]}
+                    sig_rels: List[str] = []
+                    for axis_sig in sorted(set(sigs_a) | set(sigs_b)):
+                        iv_a = evaluate_axis_for_expr(cum_a, axis_sig)
+                        iv_b = evaluate_axis_for_expr(cum_b, axis_sig)
+                        rel = _interval_set_relation(iv_a, iv_b)
+                        sig_rels.append(rel)
+                        if var_overlaps_out is not None:
+                            rep = sigs_a.get(axis_sig) or sigs_b.get(axis_sig)
+                            var_overlaps_out.append(VariableOverlap(
+                                variable=rep.display_name(),
+                                interval_a=iv_a, interval_b=iv_b,
+                                intersection=iv_a.intersect(iv_b),
+                                relation=rel,
+                            ))
+                    root_contribs.append(_combine(sig_rels))
+                elif va:
+                    root_contribs.append(SUBSET)
+                else:
+                    root_contribs.append(SUPERSET)
+            # Within ONE root-slice, own constraints + axes still combine
+            # via AND-semantics ("any DISJOINT wins" is correct here), so
+            # ``_combine`` is the right tool for this inner reduction.
+            common_relations.append(_combine(root_contribs))
+        elif in_a:
+            # Only A can produce elements of this root at all -- B's
+            # slice here is the empty set. This root can never make the
+            # objects DISJOINT-overall any more or less true (it
+            # contributes nothing to A∩B either way), but it DOES rule
+            # out EQUAL and SUBSET (A has something B entirely lacks).
+            only_in_a = True
+        else:
+            only_in_b = True
+
+    if all(v == DISJOINT for v in common_relations):
+        return DISJOINT
+    if not only_in_a and not only_in_b and all(v == EQUAL for v in common_relations):
+        return EQUAL
+    if not only_in_a and all(v in (EQUAL, SUBSET) for v in common_relations):
+        return SUBSET
+    if not only_in_b and all(v in (EQUAL, SUPERSET) for v in common_relations):
+        return SUPERSET
+    return OVERLAP
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Dependency-tree helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _extract_object_chain_from_tree(
-    node: CutDependency,
-) -> Optional[ObjectInheritanceChain]:
-    """
-    If the subtree rooted at `node` represents a single linear object
-    inheritance chain (object → object → ... → builtin), flatten it to
-    an ObjectInheritanceChain. Returns None if the shape doesn't match.
-
-    The flattened chain carries the structured ``constraint_exprs`` for
-    each level — preserving AND/OR shape so the IntervalSet evaluator
-    can correctly handle union-shaped acceptance regions (e.g. cuts of
-    the form ``reject ... [] a b``). The flat ``cuts`` view is derived
-    on demand from those expressions by ``InheritanceLevel.cuts``.
-    """
-    if node is None or node.kind != "object":
-        return None
-    from ir_extractor import InheritanceLevel
-
-    chain = ObjectInheritanceChain()
-    chain.levels.append(InheritanceLevel(
-        name=node.name, is_builtin=False,
-        constraint_exprs=list(node.own_constraint_exprs)))
-
-    current = node
-    while current.children:
-        obj_children = [c for c in current.children
-                        if c.kind in ("object", "builtin")]
-        if len(obj_children) != 1:
-            # Accept union-of-builtins-agreeing-on-root (rare but possible)
-            builtins = [c for c in current.children if c.kind == "builtin"]
-            if builtins and len(builtins) == len(current.children):
-                names = {canonicalise(c.name) for c in builtins}
-                if len(names) == 1:
-                    chain.levels.append(InheritanceLevel(
-                        name=next(iter(names)), is_builtin=True))
-                    return chain
-            return None
-        child = obj_children[0]
-        if child.kind == "builtin":
-            chain.levels.append(InheritanceLevel(
-                name=canonicalise(child.name), is_builtin=True))
-            return chain
-        chain.levels.append(InheritanceLevel(
-            name=child.name, is_builtin=False,
-            constraint_exprs=list(child.own_constraint_exprs)))
-        current = child
-    return chain
-
-
 def _object_children(node: CutDependency) -> List[CutDependency]:
-    return [ch for ch in node.children if ch.kind == "object"]
+    return [ch for ch in node.children if isinstance(ch, ObjectDependency)]
 
 
 def _define_children(node: CutDependency) -> List[CutDependency]:
-    return [ch for ch in node.children if ch.kind == "define"]
+    return [ch for ch in node.children if isinstance(ch, DefineDependency)]
 
 
 def _root_of_object_subtree(obj_node: CutDependency) -> str:
-    chain = _extract_object_chain_from_tree(obj_node)
-    if chain is None:
+    """A single representative root, for grouping/bucketing purposes
+    (report-signature keys, pairing object children by root). A Union
+    object genuinely has more than one root — see ``ObjectDependency.roots()``
+    for the full set — but the bucket-keying call sites here only need a
+    stable, deterministic representative, matching ``ObjectIR.root_type()``'s
+    same convention."""
+    if not isinstance(obj_node, ObjectDependency):
         return ""
-    return chain.root
-
-
-def _compare_object_subtrees(
-    obj_a: CutDependency, obj_b: CutDependency,
-) -> str:
-    chain_a = _extract_object_chain_from_tree(obj_a)
-    chain_b = _extract_object_chain_from_tree(obj_b)
-    if chain_a is None or chain_b is None:
-        return OVERLAP
-    return _compare_object_chains(chain_a, chain_b)
+    roots = obj_node.roots()
+    return sorted(roots)[0] if roots else ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -864,8 +948,8 @@ def _compare_dep_nodes(
     if node_a is None or node_b is None:
         return OVERLAP
 
-    # Object × object handled by chain cumulative comparison
-    if node_a.kind == "object" and node_b.kind == "object":
+    # Object × object handled by cumulative-constraint comparison
+    if isinstance(node_a, ObjectDependency) and isinstance(node_b, ObjectDependency):
         return _compare_object_subtrees(node_a, node_b)
 
     # Everything else: compose children + own constraints
@@ -994,13 +1078,13 @@ def _define_signature(node: CutDependency) -> Tuple:
             for c in constraint_expr_leaves(ce):
                 funcs.append((c.func_chain or "").lower())
         for ch in n.children:
-            if ch.kind == "object":
+            if isinstance(ch, ObjectDependency):
                 r = _root_of_object_subtree(ch)
                 if r:
                     roots.append(r)
-            elif ch.kind == "define":
+            elif isinstance(ch, DefineDependency):
                 walk(ch)
-            elif ch.kind == "builtin":
+            elif isinstance(ch, BuiltinDependency):
                 roots.append(canonicalise(ch.name))
     walk(node)
     return (tuple(sorted(roots)), tuple(sorted(funcs)))
@@ -1098,7 +1182,7 @@ def _top_level_signature(tree: CutDependency) -> Optional[Tuple[str, Tuple[str, 
 
     keys: List[str] = []
     for ch in tree.children:
-        if ch.kind == "object":
+        if isinstance(ch, ObjectDependency):
             # Use the canonical built-in root, NOT the local user-defined
             # object name. This is what enables cross-analysis pairing of
             # cuts that reference differently-named objects on the same
@@ -1107,9 +1191,9 @@ def _top_level_signature(tree: CutDependency) -> Optional[Tuple[str, Tuple[str, 
             r = _root_of_object_subtree(ch)
             if r:
                 keys.append(f"{canonicalise(r)}|{slice_tok}")
-        elif ch.kind == "builtin":
+        elif isinstance(ch, BuiltinDependency):
             keys.append(f"{canonicalise(ch.name)}|{slice_tok}")
-        elif ch.kind == "define":
+        elif isinstance(ch, DefineDependency):
             # Composite cuts may pull in defines (e.g. ``ST > 300`` where
             # ST itself decomposes further). Use the define name as a key
             # so cuts referencing the same define pair across sides.
@@ -1126,16 +1210,84 @@ def _top_level_signature(tree: CutDependency) -> Optional[Tuple[str, Tuple[str, 
 
 
 def _collect_region_cuts(reg: RegionIR) -> List[ResolvedCutIR]:
+    """The region's flattened, comparable cut set: inherited cuts plus
+    its own, minus inheritance/``select ALL`` lines (which carry no
+    constraint of their own) and minus opaque lines (handled separately,
+    see ``_collect_opaque_region_cuts``)."""
     out: List[ResolvedCutIR] = []
-    for rc in reg.resolved_cuts:
+    for rc in reg.comparison_cuts():
+        if rc.region_role in ("inherit", "all", "opaque"):
+            continue
         if rc.command in ("SELECT", "BIN", "REJECT"):
             out.append(rc)
     return out
 
 
+def _render_origin_path(path: Tuple[str, ...]) -> str:
+    return " → ".join(path) if path else "this region"
+
+
+def _merge_same_axis_cuts(rcs: List[ResolvedCutIR]) -> ResolvedCutIR:
+    """Fold several cuts on the SAME variable (one signature bucket, one
+    side) into a single synthetic cut.
+
+    A region is the AND of its cuts, so ``Size(X) >= 0`` (inherited from
+    a parent) and ``Size(X) == 2`` (the child's own) jointly accept
+    ``Size(X) == 2``. Comparing them cross-wise against the other side —
+    ``>=0 vs ==2`` → SUPERSET, ``==2 vs >=0`` → SUBSET — mixes into a
+    false OVERLAP even for a self-comparison. Concatenating their
+    ``own_constraint_exprs`` lets the per-axis evaluator intersect them
+    first (``evaluate_axis_for_exprs``), so the side is compared once,
+    as a whole. Object/define children are shared (deduplicated by
+    identity — the resolver caches them, so equal references are the
+    same node).
+    """
+    tree = CutRootDependency(name=" ∧ ".join(
+        (rc.dependency_tree.name or "?") for rc in rcs))
+    seen_children: Set[int] = set()
+    for rc in rcs:
+        t = rc.dependency_tree
+        tree.own_constraint_exprs.extend(t.own_constraint_exprs)
+        for ch in t.children:
+            if id(ch) not in seen_children:
+                seen_children.add(id(ch))
+                tree.children.append(ch)
+    leaf_chains: Dict[int, List[str]] = {}
+    for rc in rcs:
+        leaf_chains.update(rc.leaf_chains)
+    return ResolvedCutIR(
+        command="SELECT",
+        surface_vars=set().union(*(rc.surface_vars for rc in rcs)),
+        resolved_vars=set().union(*(rc.resolved_vars for rc in rcs)),
+        builtin_objects=set().union(*(rc.builtin_objects for rc in rcs)),
+        constraint_expr=ConstraintAnd(tuple(rc.constraint_expr for rc in rcs)),
+        dependency_tree=tree,
+        leaf_chains=leaf_chains,
+        region_role="own",
+    )
+
+
+def _collect_opaque_region_cuts(reg: RegionIR) -> List[ResolvedCutIR]:
+    """Lines whose region reference can't be modelled (``reject R``, R in
+    a compound condition, a cycle, an unknown name) — own or inherited."""
+    return [rc for rc in reg.comparison_cuts() if rc.region_role == "opaque"]
+
+
 def _build_var_overlap_from_tree_leaf(
     tree_a: CutDependency, tree_b: CutDependency,
+    leaf_chains_a: Optional[Dict[int, List[str]]] = None,
+    leaf_chains_b: Optional[Dict[int, List[str]]] = None,
 ) -> Optional[VariableOverlap]:
+    """``leaf_chains_a``/``leaf_chains_b`` are the owning ResolvedCutIR's
+    ``leaf_chains`` maps ({id(leaf): chain}) — the per-cut outer-path
+    provenance that replaced mutating ``CutStructure.define_chain`` in
+    place once object/define dependency nodes became cached and shared
+    across cuts (see ir_extractor.DefineResolver._compute_leaf_chains).
+    ``leaf.define_chain`` itself now only reports the leaf's LOCAL
+    owning-node name, not the outer path from this specific cut's root,
+    so it is no longer the right source for the provenance chain shown
+    here.
+    """
     leaves_a = [c for ce in tree_a.own_constraint_exprs
                   for c in constraint_expr_leaves(ce)]
     leaves_b = [c for ce in tree_b.own_constraint_exprs
@@ -1168,8 +1320,8 @@ def _build_var_overlap_from_tree_leaf(
             interval_a=every, interval_b=every,
             intersection=every,
             relation=rel,
-            chain_a=list(fc_a.define_chain),
-            chain_b=list(fc_b.define_chain),
+            chain_a=list((leaf_chains_a or {}).get(id(fc_a), [])),
+            chain_b=list((leaf_chains_b or {}).get(id(fc_b), [])),
         )
 
     # Same option-B logic as _compare_compound_nodes' leaf branch:
@@ -1192,8 +1344,8 @@ def _build_var_overlap_from_tree_leaf(
         interval_a=iv_a, interval_b=iv_b,
         intersection=iv_a.intersect(iv_b),
         relation=rel,
-        chain_a=list(fc_a.define_chain),
-        chain_b=list(fc_b.define_chain),
+        chain_a=list((leaf_chains_a or {}).get(id(fc_a), [])),
+        chain_b=list((leaf_chains_b or {}).get(id(fc_b), [])),
     )
 
 
@@ -1274,9 +1426,9 @@ def _is_simple_cardinality_cut(tree: CutDependency) -> bool:
     if fc.lhs.outer_func_chain().lower() not in _CARDINALITY_FUNCS:
         return False
     obj_or_builtin_children = [
-        ch for ch in tree.children if ch.kind in ("object", "builtin")
+        ch for ch in tree.children if isinstance(ch, (ObjectDependency, BuiltinDependency))
     ]
-    define_children = [ch for ch in tree.children if ch.kind == "define"]
+    define_children = [ch for ch in tree.children if isinstance(ch, DefineDependency)]
     return len(obj_or_builtin_children) == 1 and not define_children
 
 
@@ -1286,7 +1438,7 @@ def _cardinality_object_child(tree: CutDependency) -> Optional[CutDependency]:
     if not _is_simple_cardinality_cut(tree):
         return None
     for ch in tree.children:
-        if ch.kind in ("object", "builtin"):
+        if isinstance(ch, (ObjectDependency, BuiltinDependency)):
             return ch
     return None
 
@@ -1316,8 +1468,51 @@ def _compare_region_variables(
         else:
             sig_b.setdefault(s, []).append(rc)
 
+    # Several cuts on one side in the same bucket are cuts on the same
+    # variable — AND them into one before pairing (see
+    # ``_merge_same_axis_cuts``). ``~=`` buckets are left alone: a
+    # chi-square minimization has no interval to intersect.
+    merged_info: Dict[int, Tuple[str, Tuple[str, ...], List[ResolvedCutIR], RegionIR]] = {}
+    for side, sig_map, reg in (("A", sig_a, reg_a), ("B", sig_b, reg_b)):
+        for key, rcs in list(sig_map.items()):
+            if len(rcs) < 2 or any(_tree_has_chi2_min(rc.dependency_tree) for rc in rcs):
+                continue
+            merged = _merge_same_axis_cuts(rcs)
+            origins: List[Tuple[str, ...]] = []
+            for rc in rcs:
+                o = reg.cut_origins.get(id(rc), ())
+                if o not in origins:
+                    origins.append(o)
+            if origins == [()]:
+                origin: Tuple[str, ...] = ()
+            elif len(origins) == 1:
+                origin = origins[0]
+            else:
+                origin = (" + ".join(_render_origin_path(o) for o in origins),)
+            merged_info[id(merged.dependency_tree)] = (side, origin, rcs, reg)
+            sig_map[key] = [merged]
+
     cut_pair_results: List[CutPairResult] = []
     headline_vars: List[VariableOverlap] = []
+
+    # Opaque region-reference lines: never matched, always OVERLAP. AND-ing
+    # an unknown constraint into a region can only shrink it, so a DISJOINT
+    # proven on another axis stays sound — but EQUAL/SUBSET/SUPERSET can no
+    # longer be claimed, which OVERLAP enforces through ``_combine``.
+    for rc in _collect_opaque_region_cuts(reg_a):
+        cut_pair_results.append(CutPairResult(
+            surface_a=rc.surface_vars, surface_b=set(),
+            structure_matched=False, dep_values_matched=False,
+            verdict=OVERLAP, notes=[f"A: {rc.region_note}"],
+            tree_a=rc.dependency_tree, opaque_region_ref=True,
+        ))
+    for rc in _collect_opaque_region_cuts(reg_b):
+        cut_pair_results.append(CutPairResult(
+            surface_a=set(), surface_b=rc.surface_vars,
+            structure_matched=False, dep_values_matched=False,
+            verdict=OVERLAP, notes=[f"B: {rc.region_note}"],
+            tree_b=rc.dependency_tree, opaque_region_ref=True,
+        ))
 
     for s in sorted(set(sig_a) | set(sig_b), key=lambda t: (t[0], t[1])):
         # t[1] is a tuple[str, ...] → naturally sortable.
@@ -1366,10 +1561,33 @@ def _compare_region_variables(
                     for ib in range(len(in_b))
                 ]
 
+                # Whether each (ia, ib) pair "contributes" (feeds verdict
+                # aggregation) depends only on obj_rel/best_rank, which
+                # are already fully known — so this can be decided for
+                # every pair up front, in one shot, rather than
+                # discovered incrementally while emitting rows. That
+                # matters because whether a NON-contributing pair is
+                # worth *showing* depends on whether either of its two
+                # cuts ends up matched somewhere else in the bucket, and
+                # that "somewhere else" can be a pair processed later in
+                # a naive single pass.
+                contributing: Dict[Tuple[int, int], bool] = {}
+                for ia in range(len(in_a)):
+                    for ib in range(len(in_b)):
+                        r = obj_rel[(ia, ib)]
+                        rank = _OBJ_REL_RANK[r]
+                        contributing[(ia, ib)] = (
+                            r != DISJOINT
+                            and rank == best_rank_a[ia]
+                            and rank == best_rank_b[ib]
+                        )
+
                 # Track which cuts ended up in a contributing pair so
                 # we know which ones still need a directional row.
-                a_matched = [False] * len(in_a)
-                b_matched = [False] * len(in_b)
+                a_matched = [any(contributing[(ia, ib)] for ib in range(len(in_b)))
+                             for ia in range(len(in_a))]
+                b_matched = [any(contributing[(ia, ib)] for ia in range(len(in_a)))
+                             for ib in range(len(in_b))]
 
                 # 1. Emit one row per cross-pair. A pair "contributes"
                 #    (feeds verdict aggregation) only if it is a real
@@ -1378,20 +1596,23 @@ def _compare_region_variables(
                 #      * the object-relation rank equals the best
                 #        available rank for both rc_a and rc_b.
                 #    All other pairs are informational (shown for
-                #    transparency, excluded from aggregation).
+                #    transparency, excluded from aggregation) — but only
+                #    when they're genuinely being "passed over" in favor
+                #    of a real match: if NEITHER rc_a nor rc_b has a
+                #    contributing pair anywhere in the bucket, this row
+                #    would just restate — a third time — the same "no
+                #    real counterpart" conclusion the directional
+                #    fallback rows in step 2 already give it, so it's
+                #    skipped entirely.
                 for ia, rc_a in enumerate(in_a):
                     for ib, rc_b in enumerate(in_b):
-                        r = obj_rel[(ia, ib)]
-                        rank = _OBJ_REL_RANK[r]
-                        is_contributing = (
-                            r != DISJOINT
-                            and rank == best_rank_a[ia]
-                            and rank == best_rank_b[ib]
-                        )
-
-                        if not is_contributing:
-                            # Informational row — shown for transparency,
-                            # excluded from verdict aggregation.
+                        if not contributing[(ia, ib)]:
+                            if not a_matched[ia] and not b_matched[ib]:
+                                # No real counterpart exists anywhere for
+                                # either cut — step 2's directional rows
+                                # already say this; don't repeat it here.
+                                continue
+                            r = obj_rel[(ia, ib)]
                             if r == DISJOINT:
                                 why = (
                                     "Cardinality cuts on disjoint "
@@ -1426,7 +1647,8 @@ def _compare_region_variables(
                         v = _compare_dep_nodes(rc_a.dependency_tree,
                                                rc_b.dependency_tree)
                         vo = _build_var_overlap_from_tree_leaf(
-                            rc_a.dependency_tree, rc_b.dependency_tree)
+                            rc_a.dependency_tree, rc_b.dependency_tree,
+                            rc_a.leaf_chains, rc_b.leaf_chains)
                         var_overlaps_for_pair = [vo] if vo is not None else []
                         cut_pair_results.append(CutPairResult(
                             surface_a=rc_a.surface_vars,
@@ -1440,8 +1662,6 @@ def _compare_region_variables(
                         ))
                         if vo is not None:
                             headline_vars.append(vo)
-                        a_matched[ia] = True
-                        b_matched[ib] = True
 
                 # 2. Emit directional rows for cuts that didn't appear
                 #    in any contributing pair — they genuinely lack a
@@ -1484,7 +1704,8 @@ def _compare_region_variables(
                         v = _compare_dep_nodes(rc_a.dependency_tree,
                                                rc_b.dependency_tree)
                         vo = _build_var_overlap_from_tree_leaf(
-                            rc_a.dependency_tree, rc_b.dependency_tree)
+                            rc_a.dependency_tree, rc_b.dependency_tree,
+                            rc_a.leaf_chains, rc_b.leaf_chains)
                         var_overlaps_for_pair = [vo] if vo is not None else []
                         cut_pair_results.append(CutPairResult(
                             surface_a=rc_a.surface_vars,
@@ -1597,6 +1818,38 @@ def _compare_region_variables(
             tree_b=rc.dependency_tree,
         ))
 
+    # Stamp inheritance provenance. Each ResolvedCutIR owns a unique root
+    # dependency tree, so the tree identity maps a row back to its cut.
+    origin_by_tree_a = {id(rc.dependency_tree): reg_a.cut_origins.get(id(rc), ())
+                        for rc in reg_a.comparison_cuts()}
+    origin_by_tree_b = {id(rc.dependency_tree): reg_b.cut_origins.get(id(rc), ())
+                        for rc in reg_b.comparison_cuts()}
+    def _merge_note(info) -> str:
+        side, _origin, rcs, reg = info
+        parts = []
+        for rc in rcs:
+            o = reg.cut_origins.get(id(rc), ())
+            tag = f" [from {_render_origin_path(o)}]" if o else ""
+            parts.append(f"{rc.dependency_tree.name}{tag}")
+        return (f"{side}: {len(rcs)} cuts on this variable combined (AND) "
+                f"before comparison: " + "; ".join(parts) + ".")
+
+    for cp in cut_pair_results:
+        if cp.tree_a is not None:
+            info = merged_info.get(id(cp.tree_a))
+            if info is not None:
+                cp.origin_a = info[1]
+                cp.notes.append(_merge_note(info))
+            else:
+                cp.origin_a = origin_by_tree_a.get(id(cp.tree_a), ())
+        if cp.tree_b is not None:
+            info = merged_info.get(id(cp.tree_b))
+            if info is not None:
+                cp.origin_b = info[1]
+                cp.notes.append(_merge_note(info))
+            else:
+                cp.origin_b = origin_by_tree_b.get(id(cp.tree_b), ())
+
     return cut_pair_results, headline_vars
 
 
@@ -1619,7 +1872,7 @@ def _check_region_pair(
             shared_builtin_objects=shared_builtins,
             verdict=DISJOINT,
             notes=["No shared built-in collections between these regions (Rule 1)."],
-            cuts_a=reg_a.resolved_cuts, cuts_b=reg_b.resolved_cuts,
+            cuts_a=reg_a.comparison_cuts(), cuts_b=reg_b.comparison_cuts(),
         )
 
     # Rules 2 & 3
@@ -1649,6 +1902,8 @@ def _check_region_pair(
             f"verdict aggregation."
         )
     notes.append(f"Combined verdict: {verdict}.")
+    notes.extend(_region_inheritance_notes(reg_a, "A"))
+    notes.extend(_region_inheritance_notes(reg_b, "B"))
 
     return RegionPairResult(
         region_a=name_a, region_b=name_b,
@@ -1658,13 +1913,47 @@ def _check_region_pair(
         variable_overlaps=headline_vars,
         verdict=verdict,
         notes=notes,
-        cuts_a=reg_a.resolved_cuts, cuts_b=reg_b.resolved_cuts,
+        cuts_a=reg_a.comparison_cuts(), cuts_b=reg_b.comparison_cuts(),
     )
+
+
+def _region_inheritance_notes(reg: RegionIR, side: str) -> List[str]:
+    """Human-readable inheritance summary + warnings for one side."""
+    out: List[str] = []
+    if reg.parents:
+        out.append(f"{side}: {reg.name} inherits from {', '.join(reg.parents)}.")
+    for w in reg.warnings:
+        out.append(f"{side} ⚠ {reg.name}: {w}")
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Object-level comparison for the report (informational only)
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _dep_chain_repr(node: Optional[CutDependency]) -> str:
+    """A short, readable linear rendering of an object's inheritance chain,
+    e.g. ``"goodJets -> jets -> JET"``, for display purposes only (report
+    notes/tables). Mirrors the old (removed) ``ObjectInheritanceChain.__repr__``
+    format. Walks the first ObjectDependency/BuiltinDependency child at each
+    level -- a Union object has more than one branch (see ``roots()``), but a
+    single representative path is all a display string needs."""
+    if node is None:
+        return "Chain()"
+    names = [node.name]
+    cur = node
+    while True:
+        nxt = next(
+            (ch for ch in cur.children
+             if isinstance(ch, (ObjectDependency, BuiltinDependency))),
+            None,
+        )
+        if nxt is None:
+            break
+        names.append(nxt.name)
+        cur = nxt
+    return "Chain(" + " -> ".join(names) + ")"
+
 
 def _check_object_pair_for_report(
     obj_a: ObjectIR, ir_a: AnalysisIR,
@@ -1672,17 +1961,19 @@ def _check_object_pair_for_report(
 ) -> ObjectPairResult:
     chain_a = obj_a.chain
     chain_b = obj_b.chain
-    root_a = chain_a.root
-    root_b = chain_b.root
+    root_a = obj_a.root_type()
+    root_b = obj_b.root_type()
+    roots_a = chain_a.roots() if chain_a is not None else set()
+    roots_b = chain_b.roots() if chain_b is not None else set()
 
     var_overlaps: List[VariableOverlap] = []
-    if root_a != "UNKNOWN" and root_a == root_b:
-        verdict = _compare_object_chains(chain_a, chain_b,
-                                         var_overlaps_out=var_overlaps)
+    if roots_a and roots_b and (roots_a & roots_b):
+        verdict = _compare_object_subtrees(chain_a, chain_b,
+                                            var_overlaps_out=var_overlaps)
     else:
         verdict = OVERLAP
 
-    struct_matched = (root_a == root_b and root_a != "UNKNOWN")
+    struct_matched = bool(roots_a and roots_b and (roots_a & roots_b))
     dep_values_matched = (verdict == EQUAL)
 
     notes: List[str] = []
@@ -1702,7 +1993,7 @@ def _check_object_pair_for_report(
     return ObjectPairResult(
         object_a=obj_a.name, object_b=obj_b.name,
         analysis_a=ir_a.source_file, analysis_b=ir_b.source_file,
-        chain_a=repr(chain_a), chain_b=repr(chain_b),
+        chain_a=_dep_chain_repr(chain_a), chain_b=_dep_chain_repr(chain_b),
         root_a=root_a, root_b=root_b,
         structure_matched=struct_matched,
         dep_values_matched=dep_values_matched,
@@ -1760,7 +2051,7 @@ def compare(
                     verdict=DISJOINT,
                     notes=["No shared built-in collections between "
                            "the two ADLs (Rule 1)."],
-                    cuts_a=reg_a.resolved_cuts, cuts_b=reg_b.resolved_cuts,
+                    cuts_a=reg_a.comparison_cuts(), cuts_b=reg_b.comparison_cuts(),
                 ))
     else:
         for name_a, reg_a in ir_a.regions.items():

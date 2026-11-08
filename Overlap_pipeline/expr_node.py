@@ -227,22 +227,44 @@ class IdNode(ExprNode):
         ``MET > 300``, where ``MET`` is a built-in scalar);
       * unresolved define names that survive substitution (rare, but
         possible — handled defensively).
+
+    ``src_object`` — the user-defined ADL object this node was
+    substituted from, when applicable (empty for direct builtin
+    references such as ``MET`` or ``pT(JET)``). ``collection`` always
+    holds the canonical builtin root (e.g. ``"JET"``) so existing
+    root-based logic (builtin detection, ``roots()``, grouping) is
+    unaffected; ``src_object`` is purely an extra discriminator so two
+    DIFFERENT objects sharing the same root — e.g. ``jets`` and
+    ``nonbjets``, both rooted at JET — don't collapse into one
+    indistinguishable placeholder once substituted into an expression
+    (they'd otherwise both render as ``JET`` and share one signature,
+    so a cut like ``dR(ELE, nonbjets)`` and another like
+    ``dR(ELE, jets)`` would wrongly be treated as constraints on the
+    exact same axis and get intersected together).
     """
     collection: str
     accessor: Tuple[int, ...] = ()
+    src_object: str = ""
 
     def signature(self) -> str:
-        return f"id:{self.collection.lower()}|{_accessor_token(self.accessor)}"
+        base = f"id:{self.collection.lower()}|{_accessor_token(self.accessor)}"
+        if self.src_object:
+            return f"{base}~{self.src_object.lower()}"
+        return base
 
     def full_signature(self) -> str:
         return self.signature()  # no numeric values to add
 
     def pretty(self) -> str:
+        # Prefer the originating object's own name for display — it's
+        # what the user actually wrote, and it's what disambiguates two
+        # same-rooted-but-different objects in report output.
+        name = self.src_object or self.collection
         if not self.accessor:
-            return self.collection
+            return name
         if len(self.accessor) == 2 and self.accessor[1] == self.accessor[0] + 1:
-            return f"{self.collection}[{self.accessor[0]}]"
-        return f"{self.collection}[{self.accessor[0]}:{self.accessor[1]}]"
+            return f"{name}[{self.accessor[0]}]"
+        return f"{name}[{self.accessor[0]}:{self.accessor[1]}]"
 
     def primary_collection(self) -> str:
         return self.collection
@@ -482,9 +504,9 @@ def num(v: float) -> NumNode:
     return NumNode(value=float(v))
 
 
-def ident(collection: str, accessor: Tuple[int, ...] = ()) -> IdNode:
+def ident(collection: str, accessor: Tuple[int, ...] = (), src_object: str = "") -> IdNode:
     """Make an identifier node."""
-    return IdNode(collection=collection, accessor=tuple(accessor))
+    return IdNode(collection=collection, accessor=tuple(accessor), src_object=src_object)
 
 
 def fn(chain: str, *args: ExprNode) -> FuncNode:
@@ -573,7 +595,8 @@ def build_expr_node(expr: dict, expr_repr_fn=None) -> ExprNode:
 
     if tok == "ID":
         from ir_extractor import _normalise_accessor  # local: avoid cycle
-        return ident(expr["id"], _normalise_accessor(expr.get("accessor", [])))
+        return ident(expr["id"], _normalise_accessor(expr.get("accessor", [])),
+                     src_object=expr.get("src_object", ""))
 
     if tok == "FUNCTION":
         # Reproduce the existing chain-collapsing behaviour used by

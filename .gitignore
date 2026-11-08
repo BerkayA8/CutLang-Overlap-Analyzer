@@ -2,3 +2,9 @@ __pycache__/
 .DS_Store
 
 TEST/
+
+Overlap_pipeline/adl_to_json
+adl/Parser.cpp
+adl/Parser.h
+adl/Scanner.cpp
+adl/location.hh

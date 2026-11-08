@@ -23,7 +23,7 @@ from typing import List, Optional
 
 from ir_extractor import (
     AnalysisIR, ObjectIR, RegionIR, ResolvedCutIR,
-    CutStructure, CutDependency, ObjectInheritanceChain,
+    CutStructure, CutDependency, DefineDependency,
     constraint_expr_leaves,
 )
 
@@ -40,47 +40,35 @@ class OverlapObject:
     kind        – "object" | "define" | "region_cut"
     name        – declared name (e.g. "jets", "HT", "select MHT > 300")
     region      – region name (for region_cut), empty otherwise
-    dependency_tree – CutDependency tree (None for objects, set for define/cut)
-    chain       – ObjectInheritanceChain (for objects, None otherwise)
+    node        – the CutDependency-family tree for this entity: an
+                  ObjectDependency for "object" (``ObjectIR.chain`` is
+                  already a CutDependency subclass since the class-
+                  hierarchy refactor, so objects and defines/cuts share
+                  a single representation here), a DefineDependency/
+                  CutRootDependency subtree for "define"/"region_cut",
+                  or None if it couldn't be found/built.
     """
     kind: str
     name: str
     region: str = ""
-    dependency_tree: Optional[CutDependency] = None
-    chain: Optional[ObjectInheritanceChain] = None
+    node: Optional[CutDependency] = None
 
     @property
     def struct_sig(self) -> tuple:
-        if self.dependency_tree is not None:
-            return self.dependency_tree.struct_sig()
-        if self.chain is not None:
-            return self.chain.struct_sig()
+        if self.node is not None:
+            return self.node.struct_sig()
         return ()
 
     @property
     def full_dep_sig(self) -> tuple:
-        if self.dependency_tree is not None:
-            return self.dependency_tree.full_dep_sig()
-        if self.chain is not None:
-            return self.chain.full_dep_sig()
+        if self.node is not None:
+            return self.node.full_dep_sig()
         return ()
 
     @property
     def children_full_dep_sig(self) -> tuple:
-        if self.dependency_tree is not None:
-            return self.dependency_tree.children_full_dep_sig()
-        if self.chain is not None and self.chain.levels:
-            # For objects: parent levels (everything except leaf own cuts)
-            if len(self.chain.levels) <= 1:
-                return ()
-            return tuple(
-                (lv.is_builtin,
-                 tuple(sorted(
-                     (c.func_chain, c.resolved_collection.lower(), c.op, c.threshold)
-                     for c in lv.cuts
-                 )))
-                for lv in self.chain.levels[1:]
-            )
+        if self.node is not None:
+            return self.node.children_full_dep_sig()
         return ()
 
     def display_label(self) -> str:
@@ -93,11 +81,8 @@ class OverlapObject:
         return self.name
 
     def constraint_summary(self) -> str:
-        if self.dependency_tree is not None:
-            leaves = [c for ce in self.dependency_tree.own_constraint_exprs
-                        for c in constraint_expr_leaves(ce)]
-        elif self.chain is not None and self.chain.levels:
-            leaves = [c for ce in self.chain.levels[0].constraint_exprs
+        if self.node is not None:
+            leaves = [c for ce in self.node.own_constraint_exprs
                         for c in constraint_expr_leaves(ce)]
         else:
             leaves = []
@@ -133,7 +118,7 @@ def build_catalogue(ir: AnalysisIR) -> AnalysisCatalogue:
         oo = OverlapObject(
             kind="object",
             name=name,
-            chain=obj.chain,
+            node=obj.chain,
         )
         cat.objects.append(oo)
 
@@ -145,7 +130,7 @@ def build_catalogue(ir: AnalysisIR) -> AnalysisCatalogue:
         oo = OverlapObject(
             kind="define",
             name=name,
-            dependency_tree=dep_tree,
+            node=dep_tree,
         )
         cat.defines.append(oo)
 
@@ -157,7 +142,7 @@ def build_catalogue(ir: AnalysisIR) -> AnalysisCatalogue:
                 kind="region_cut",
                 name=label,
                 region=rname,
-                dependency_tree=rc.dependency_tree,
+                node=rc.dependency_tree,
             )
             cat.region_cuts.append(oo)
 
@@ -167,10 +152,10 @@ def build_catalogue(ir: AnalysisIR) -> AnalysisCatalogue:
 def _find_define_tree(ir: AnalysisIR, define_name: str) -> Optional[CutDependency]:
     """
     Find the CutDependency subtree node for a define by searching region cuts.
-    Returns the first [define] child node with matching name.
+    Returns the first DefineDependency child node with matching name.
     """
     def search(node: CutDependency, name: str) -> Optional[CutDependency]:
-        if node.kind == "define" and node.name.lower() == name.lower():
+        if isinstance(node, DefineDependency) and node.name.lower() == name.lower():
             return node
         for ch in node.children:
             r = search(ch, name)
@@ -227,12 +212,9 @@ def render_catalogue_terminal(cat: AnalysisCatalogue) -> str:
             lines.append(f"  {kind_color}{oo.display_label()}{RESET}{region_tag}")
             cs = oo.constraint_summary()
             lines.append(f"    constraints: \033[96m{cs}\033[0m")
-            if oo.dependency_tree and oo.kind != "object":
-                tree_str = oo.dependency_tree.pretty(indent=2)
+            if oo.node:
+                tree_str = oo.node.pretty(indent=2)
                 lines.append(f"    dep tree:\n{tree_str}")
-            elif oo.chain:
-                chain_str = str(oo.chain)
-                lines.append(f"    chain: {chain_str}")
 
     return "\n".join(lines)
 
@@ -260,11 +242,8 @@ def render_catalogue_html(cat: AnalysisCatalogue) -> str:
         cs_html = f'<code style="color:var(--cyan)">{cs}</code>' if cs else "—"
 
         dep_html = ""
-        if oo.dependency_tree and oo.kind != "object":
-            dep_html = _dep_tree_mini_html(oo.dependency_tree)
-        elif oo.chain:
-            levels = " → ".join(lv.name for lv in oo.chain.levels)
-            dep_html = f'<span style="color:var(--muted);font-size:.72rem">{levels}</span>'
+        if oo.node:
+            dep_html = _dep_tree_mini_html(oo.node)
 
         rows += (
             f"<tr>"

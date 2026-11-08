@@ -23,7 +23,8 @@ Node schema (mirrors the C++ ast.hpp / main_json.cpp output):
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple
+import math
 
 from cpp_parser_bridge import parse_adl_file_cpp as parse_adl_file
 from cpp_parser_bridge import parse_adl_text_cpp as parse_adl_text
@@ -70,9 +71,19 @@ def _is_command(node) -> bool:
 
 # Dict constructors for building resolved expression trees
 def _make_var(id: str, alias: str = "", dotop: str = "",
-              accessor: list = None, type: str = "") -> dict:
+              accessor: list = None, type: str = "",
+              src_object: str = "") -> dict:
+    """``src_object``, when set, is the name of the user-defined ADL
+    object this ID node was substituted from (see ``_resolve_expr``'s
+    object-reference branch). It is NOT part of the raw C++ parser
+    schema — it's metadata added during resolution so that two
+    DIFFERENT objects sharing the same canonical root (e.g. ``jets``
+    and ``nonbjets``, both rooted at JET) don't collapse into an
+    indistinguishable placeholder once substituted. See
+    ``expr_node.IdNode.src_object`` for how it's consumed."""
     return {"tok": "ID", "id": id, "alias": alias, "dotop": dotop,
-            "accessor": accessor or [], "type": type}
+            "accessor": accessor or [], "type": type,
+            "src_object": src_object}
 
 def _make_func(id: str, params: list = None) -> dict:
     return {"tok": "FUNCTION", "id": id, "params": params or []}
@@ -656,6 +667,135 @@ class CutDependency:
         return "\n".join([line] + child_lines)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CutDependency subclasses
+# ─────────────────────────────────────────────────────────────────────────────
+# Real subclasses per node kind, so consumers can dispatch on
+# ``isinstance(node, ObjectDependency)`` instead of ``node.kind == "object"``.
+#
+# ``kind`` stays a plain string on every instance (set in ``__post_init__``,
+# below), so nothing that reads ``node.kind`` — ``struct_sig``,
+# ``full_dep_sig``, ``pretty``, the ``_PRETTY_KIND_*`` lookups, or any
+# external code (report.py, catalogue.py) — needs to change. Each subclass
+# additionally carries the SAME string as a class-level attribute (e.g.
+# ``ObjectDependency.kind == "object"``, readable with no instance at all),
+# matching the design's intent of a "class-level string constant" while
+# still allowing ``CutDependency`` itself to be constructed directly with
+# an arbitrary ``kind=...`` — the base class is unchanged and stays fully
+# backwards compatible with any code (or test) that builds plain
+# ``CutDependency(kind="object", ...)`` instances by hand.
+#
+# Only ``ObjectDependency`` and ``BuiltinDependency`` get ``roots()`` /
+# ``cumulative_constraint_expr()`` — a cut or define node's children can be
+# independent, non-ANDable axes, so those methods don't belong on the base
+# class or on ``CutRootDependency`` / ``DefineDependency``.
+
+
+@dataclass
+class CutRootDependency(CutDependency):
+    """The root node of one resolved SELECT/REJECT cut's dependency tree."""
+    kind = "cut"
+
+    def __post_init__(self):
+        self.kind = "cut"
+
+
+@dataclass
+class DefineDependency(CutDependency):
+    """A ``define`` substituted into a cut's dependency tree. Carries no
+    constraints of its own — it's a pure symbolic substitution node."""
+    kind = "define"
+
+    def __post_init__(self):
+        self.kind = "define"
+
+
+@dataclass
+class BuiltinDependency(CutDependency):
+    """A terminal built-in physics object (ELE, MUO, JET, ...). Leaf of
+    every object inheritance chain."""
+    kind = "builtin"
+
+    def __post_init__(self):
+        self.kind = "builtin"
+
+    def roots(self) -> Set[str]:
+        # Only a NAME ACTUALLY RECOGNISED as a built-in physics object
+        # counts as a root. _build_object_dep also creates a
+        # BuiltinDependency as a fallback label for a ``take`` target
+        # that isn't a builtin AND isn't a known object (an undeclared /
+        # typo'd name) — that fallback must NOT contribute a root, or an
+        # object with a genuinely unresolvable parent would misreport a
+        # made-up "root" instead of leaving it unknown (matching the old
+        # ObjectInheritanceChain._build_chain's ``is_builtin`` rule,
+        # which only ever set ``is_builtin=True`` for a real BUILTIN_OBJECTS
+        # match).
+        if self.name and self.name.upper() in BUILTIN_OBJECTS:
+            return {canonicalise(self.name)}
+        return set()
+
+    def cumulative_constraint_expr(self) -> ConstraintExpr:
+        # Builtins never carry own_constraint_exprs in practice, but stay
+        # defensive so a hand-built BuiltinDependency with constraints
+        # (e.g. in a unit test) still behaves sensibly.
+        if not self.own_constraint_exprs:
+            return ConstraintAnd(())
+        if len(self.own_constraint_exprs) == 1:
+            return self.own_constraint_exprs[0]
+        return ConstraintAnd(tuple(self.own_constraint_exprs))
+
+
+@dataclass
+class ObjectDependency(CutDependency):
+    """An ``object`` node. Absorbs what ``ObjectInheritanceChain`` /
+    ``InheritanceLevel`` / ``InheritanceChainBuilder`` used to do:
+
+      * ``roots()`` — the set of built-in root types reachable through
+        every ``take`` branch (plural, unlike the old scalar
+        ``ObjectInheritanceChain.root`` — a ``take Union(a, b, ...)``
+        object can genuinely have more than one root).
+      * ``cumulative_constraint_expr()`` — this object's own cuts ANDed
+        with the OR of every parent branch's cumulative constraints.
+        ORing across *all* branches (not just the first) is the fix for
+        the inheritance-chain Union bug, where only the first ``take``
+        target's cuts used to survive into the cumulative view.
+    """
+    kind = "object"
+
+    def __post_init__(self):
+        self.kind = "object"
+
+    def roots(self) -> Set[str]:
+        out: Set[str] = set()
+        for ch in self.children:
+            if isinstance(ch, (ObjectDependency, BuiltinDependency)):
+                out |= ch.roots()
+        return out
+
+    def cumulative_constraint_expr(self) -> ConstraintExpr:
+        own = ConstraintAnd(tuple(self.own_constraint_exprs)) if self.own_constraint_exprs else None
+
+        parent_nodes = [ch for ch in self.children
+                        if isinstance(ch, (ObjectDependency, BuiltinDependency))]
+        parent_exprs = [p.cumulative_constraint_expr() for p in parent_nodes]
+
+        if not parent_exprs:
+            parent_combined = None
+        elif len(parent_exprs) == 1:
+            parent_combined = parent_exprs[0]
+        else:
+            # The fix: OR across every parent branch (Union(a, b, ...)),
+            # not just the first one.
+            parent_combined = ConstraintOr(tuple(parent_exprs))
+
+        parts = [p for p in (own, parent_combined) if p is not None]
+        if not parts:
+            return ConstraintAnd(())
+        if len(parts) == 1:
+            return parts[0]
+        return ConstraintAnd(tuple(parts))
+
+
 # ANSI rendering constants used by ``CutDependency.pretty``. Module-level
 # so they're not rebuilt on every call during deep tree rendering.
 _PRETTY_KIND_LABELS = {"cut": "cut", "define": "def", "object": "obj", "builtin": "BLT"}
@@ -696,92 +836,36 @@ class ResolvedCutIR:
         default_factory=lambda: ConstraintAnd(())
     )
     dependency_tree: Optional[CutDependency] = None
+    # Per-cut external chain mapping: {id(leaf CutStructure) -> chain}.
+    # Replaces the old approach of mutating ``leaf.define_chain`` in
+    # place. Once object/define dependency nodes are cached and shared
+    # by reference across every cut that references them (see
+    # DefineResolver's caches), the SAME CutStructure leaf can appear in
+    # many different cuts' trees, each at a different path from that
+    # cut's own root — so the outer chain cannot be stored on the shared
+    # leaf itself without one cut's stamp corrupting another's. This
+    # dict holds the outer chain scoped to THIS ResolvedCutIR only; see
+    # DefineResolver._compute_leaf_chains.
+    leaf_chains: Dict[int, List[str]] = field(default_factory=dict)
+
+    # Region-inheritance role of this line (only set for region cuts;
+    # empty for object cuts). See ``_classify_region_line``:
+    #   "own"     — an ordinary cut belonging to this region
+    #   "inherit" — ``select R`` / bare ``R``: inherit region R's cuts
+    #               (``region_ref`` holds R's canonical name)
+    #   "all"     — ``select ALL``: no constraint, marks a root region
+    #   "opaque"  — a region reference the comparator cannot model
+    #               (``reject R``, R inside a compound condition, a
+    #               cycle, an unknown name). Contributes OVERLAP, never
+    #               a false DISJOINT/EQUAL. ``region_note`` says why.
+    region_role: str = ""
+    region_ref: str = ""
+    region_note: str = ""
 
     @property
     def constraints(self) -> List[CutStructure]:
         """Flat-leaf view of ``constraint_expr``. Recomputed on access."""
         return constraint_expr_leaves(self.constraint_expr)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# InheritanceLevel / ObjectInheritanceChain
-# ─────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class InheritanceLevel:
-    """One step in an object's inheritance chain.
-
-    Constraint content is stored once, in ``constraint_exprs``, the
-    list of structured ``ConstraintExpr`` trees at this level. The
-    flat ``cuts`` view is derived on demand. ``constraint_exprs`` is
-    empty for builtin terminal levels and for inheritance steps that
-    add no cuts.
-    """
-    name: str = ""
-    is_builtin: bool = False
-    constraint_exprs: List[ConstraintExpr] = field(default_factory=list)
-
-    @property
-    def cuts(self) -> List[CutStructure]:
-        """Flat-leaf view of ``constraint_exprs``. Recomputed on access."""
-        out: List[CutStructure] = []
-        for ce in self.constraint_exprs:
-            out.extend(constraint_expr_leaves(ce))
-        return out
-
-
-@dataclass
-class ObjectInheritanceChain:
-    levels: List[InheritanceLevel] = field(default_factory=list)
-
-    @property
-    def root(self) -> str:
-        if self.levels:
-            for lv in reversed(self.levels):
-                if lv.is_builtin:
-                    return canonicalise(lv.name)
-        return "UNKNOWN"
-
-    def cumulative_cuts(self) -> List[CutStructure]:
-        nc: List[CutStructure] = []
-        for lv in self.levels:
-            nc.extend(lv.cuts)
-        return nc
-
-    def cumulative_constraint_exprs(self) -> List[ConstraintExpr]:
-        """Concatenated structured forms across all inheritance levels.
-
-        Each level's constraint_exprs is a list of ConstraintExprs;
-        flattened, this gives the full conjunction of structured cuts
-        the chain imposes. Consumers (the IntervalSet evaluator) treat
-        the returned list as conjoined.
-        """
-        out: List[ConstraintExpr] = []
-        for lv in self.levels:
-            out.extend(lv.constraint_exprs)
-        return out
-
-    def struct_sig(self) -> tuple:
-        return tuple(
-            (lv.is_builtin,
-             frozenset((c.func_chain, c.op) for c in lv.cuts))
-            for lv in self.levels
-        )
-
-    def full_dep_sig(self) -> tuple:
-        return tuple(
-            (lv.is_builtin,
-             tuple(sorted(
-                 (c.func_chain, c.resolved_collection.lower(), c.op, c.threshold)
-                 for c in lv.cuts)))
-            for lv in self.levels
-        )
-
-    def __repr__(self):
-        if not self.levels:
-            return "Chain()"
-        names = " → ".join(lv.name for lv in self.levels)
-        return f"Chain({names})"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -793,23 +877,90 @@ class ObjectIR:
     name: str
     takes: List[str] = field(default_factory=list)
     own_cuts: List[ResolvedCutIR] = field(default_factory=list)
-    chain: ObjectInheritanceChain = field(default_factory=ObjectInheritanceChain)
+    # This object's own dependency-tree node. Used to be a separate
+    # ``ObjectInheritanceChain``; ``ObjectDependency`` now absorbs that
+    # role (see the class docstring). ``None`` only before extraction
+    # has run (or in the deep-recursion edge case documented on
+    # ``DefineResolver._build_object_dep``).
+    chain: Optional["ObjectDependency"] = None
 
     def all_constraints(self) -> List[CutStructure]:
-        return self.chain.cumulative_cuts()
+        if self.chain is None:
+            return []
+        return constraint_expr_leaves(self.chain.cumulative_constraint_expr())
 
     def root_type(self) -> str:
-        return self.chain.root
+        """A single representative built-in root, for callers that only
+        need a scalar (e.g. ``_resolve_expr``'s object substitution, or
+        grouping cuts by root for report display). A ``take
+        Union(a, b, ...)`` object genuinely has more than one root —
+        use ``self.chain.roots()`` directly when the full set matters,
+        such as when deciding whether two objects' root coverage
+        actually intersects.
+        """
+        if self.chain is None:
+            return "UNKNOWN"
+        roots = self.chain.roots()
+        if not roots:
+            return "UNKNOWN"
+        return sorted(roots)[0]
 
 
 @dataclass
 class RegionIR:
+    """One region block.
+
+    Region inheritance
+    ------------------
+    A line ``select R`` — or a bare ``R``, which the grammar desugars to
+    the same ``SELECT ID(R)`` — makes this region inherit every cut of
+    region R. Inheritance is a plain AND: ``SR = presel ∩ own cuts``.
+    ``select ALL`` is a no-op constraint that marks a root region.
+
+    ``resolved_cuts`` keeps every line in source order (including the
+    inheritance/ALL lines) for backward compatibility. After
+    ``extract_ir`` runs:
+
+      parents         — canonical names of directly-inherited regions
+      effective_cuts  — the flattened cut set the comparator uses:
+                        ancestors' cuts first (each ancestor once, even
+                        through a diamond), then this region's own cuts.
+                        Inheritance and ALL lines are excluded.
+      cut_origins     — {id(rc): path} provenance for inherited cuts,
+                        e.g. ``("init", "presel")`` = owned by init,
+                        reached via presel. Own cuts map to ``()``.
+      warnings        — problems found on this region's own lines
+                        (cycles, unknown names, unsupported uses).
+
+    ``effective_cuts`` stays ``None`` for a RegionIR built by hand
+    (tests); consumers then fall back to ``resolved_cuts``.
+    """
     name: str
     resolved_cuts: List[ResolvedCutIR] = field(default_factory=list)
+    parents: List[str] = field(default_factory=list)
+    has_all_marker: bool = False
+    effective_cuts: Optional[List[ResolvedCutIR]] = None
+    cut_origins: Dict[int, Tuple[str, ...]] = field(default_factory=dict)
+    warnings: List[str] = field(default_factory=list)
+
+    @property
+    def is_root(self) -> bool:
+        return not self.parents
+
+    @property
+    def own_cuts(self) -> List[ResolvedCutIR]:
+        return [rc for rc in self.resolved_cuts
+                if rc.region_role not in ("inherit", "all")]
+
+    def comparison_cuts(self) -> List[ResolvedCutIR]:
+        return self.effective_cuts if self.effective_cuts is not None else self.resolved_cuts
 
     def all_builtin_objects(self) -> Set[str]:
+        # Uses the flattened cut set, so a region whose own cuts touch
+        # no built-in collection still shares its parents' collections
+        # (otherwise Rule 1 would wrongly call it DISJOINT).
         obs: Set[str] = set()
-        for rc in self.resolved_cuts:
+        for rc in self.comparison_cuts():
             obs |= rc.builtin_objects
         return obs
 
@@ -894,6 +1045,24 @@ class DefineResolver:
 
     def __init__(self, ir: AnalysisIR):
         self.ir = ir
+        # Caches keyed by lowercased name. Built once per name, shared by
+        # reference from every cut/object/define that references it — the
+        # fix for the redundant subtree-rebuilding that used to happen on
+        # every reference site. See _build_object_dep / _get_define_dep /
+        # _get_builtin_dep / _get_region_ref_dep.
+        self._object_dep_cache: Dict[str, ObjectDependency] = {}
+        self._define_dep_cache: Dict[str, DefineDependency] = {}
+        self._builtin_dep_cache: Dict[str, BuiltinDependency] = {}
+        self._region_dep_cache: Dict[str, DefineDependency] = {}
+        # Guards the lazy own_cuts resolution in _build_object_dep against
+        # re-entrancy: an object's own SELECT/REJECT can reference the
+        # object itself by name (e.g. "object jets: select pt(jets) > 25",
+        # a common, legal ADL pattern meaning "this object's own pT").
+        # Resolving that select re-enters _build_object_dep("jets") before
+        # the outer resolution has finished — this set makes the inner
+        # call see (still-empty) own_cuts as-is instead of trying to
+        # resolve them again, which would recurse forever.
+        self._resolving_own_cuts: Set[str] = set()
 
     def resolve_cuts(self, cmds: List[dict]) -> List[ResolvedCutIR]:
         return [self._build_resolved_cut(cmd) for cmd in cmds]
@@ -927,36 +1096,59 @@ class DefineResolver:
         root_exprs: List[ConstraintExpr] = (
             [rc.constraint_expr] if constraint_expr_leaves(rc.constraint_expr) else []
         )
-        root_dep = CutDependency(
-            kind="cut", name=cut_label,
+        root_dep = CutRootDependency(
+            name=cut_label,
             own_constraint_exprs=root_exprs,
         )
         self._build_children(condition, root_dep, [], 0)
         rc.dependency_tree = root_dep
 
-        # Stamp define_chain on every constraint from the tree
-        self._stamp_chains_from_tree(root_dep, path=[])
+        # Compute this cut's own outer chain for every leaf reachable from
+        # its root — WITHOUT mutating any leaf. See ResolvedCutIR.leaf_chains.
+        rc.leaf_chains = self._compute_leaf_chains(root_dep, path=[])
 
         # Resolve collection names in constraints
         self._resolve_collections_in_tree(root_dep)
 
         return rc
 
-    # ── chain stamping ────────────────────────────────────────────────────────
+    # ── chain computation ────────────────────────────────────────────────────
 
-    def _stamp_chains_from_tree(self, node: CutDependency, path: List[str]):
-        """Stamp ``define_chain`` on every leaf cut in the tree.
+    def _compute_leaf_chains(
+        self, node: CutDependency, path: List[str],
+        out: Optional[Dict[int, List[str]]] = None,
+    ) -> Dict[int, List[str]]:
+        """Compute, without mutating any ``CutStructure``, the outer
+        define/object substitution chain for every leaf reachable from
+        ``node``, scoped to ONE cut's own tree.
 
-        Operates on ``own_constraint_exprs`` only — the single stored
-        representation. Mutating the leaves here is sufficient; there is
-        no separate flat view to keep in sync.
+        Object and define dependency nodes are now cached and shared by
+        reference across every cut that references them (see
+        ``_object_dep_cache`` / ``_define_dep_cache``), so the *same*
+        leaf ``CutStructure`` can appear in many different cuts' trees,
+        each at a different path from that cut's own root. The chain is
+        therefore not a property of the leaf itself — it depends on
+        which cut is asking — so it lives in this external, per-cut map
+        (``ResolvedCutIR.leaf_chains``) instead of being stamped onto
+        the shared leaf (which is exactly what the old
+        ``_stamp_chains_from_tree`` did, and why it's unsafe once nodes
+        are shared: the second cut to stamp a shared leaf would silently
+        overwrite the first cut's chain).
+
+        Compare ``leaf.define_chain`` — the LOCAL chain set once, at
+        cache-build time, in ``_build_object_dep`` — which reports only
+        the leaf's own owning object's name (e.g. ``["jets"]``), not the
+        outer path through whichever cut currently references it.
         """
-        current_chain = [] if node.kind == "cut" else path + [node.name]
+        if out is None:
+            out = {}
+        current_chain = [] if isinstance(node, CutRootDependency) else path + [node.name]
         for ce in node.own_constraint_exprs:
             for leaf in constraint_expr_leaves(ce):
-                leaf.define_chain = list(current_chain)
+                out[id(leaf)] = list(current_chain)
         for child in node.children:
-            self._stamp_chains_from_tree(child, current_chain)
+            self._compute_leaf_chains(child, current_chain, out)
+        return out
 
     # ── collection resolution ─────────────────────────────────────────────────
 
@@ -1017,9 +1209,8 @@ class DefineResolver:
             # e.g. "define MHT = pT(MHTLV)" shadows the builtin "MHT" object.
             dn = self.ir.get_define(name_lc)
             if dn is not None:
-                dep = CutDependency(kind="define", name=name_lc)
+                dep = self._get_define_dep(name_lc, dn["body"], new_visited, depth)
                 parent.children.append(dep)
-                self._build_children(dn["body"], dep, new_visited, depth+1)
                 return
 
             obj = self.ir.get_object(expr["id"])
@@ -1033,22 +1224,16 @@ class DefineResolver:
             reg = self.ir.regions.get(expr["id"]) or next(
                 (v for k,v in self.ir.regions.items() if k.lower()==name_lc), None)
             if reg is not None:
-                dep = CutDependency(
-                    kind="define", name=f"region:{expr['id']}",
-                )
+                dep = self._get_region_ref_dep(expr["id"], reg)
                 parent.children.append(dep)
-                for nested_rc in reg.resolved_cuts:
-                    if nested_rc.dependency_tree is not None:
-                        dep.children.append(nested_rc.dependency_tree)
 
         elif tok == "FUNCTION":
             func_lc = expr["id"].lower()
             if func_lc not in visited:
                 dn = self.ir.get_define(func_lc)
                 if dn is not None:
-                    dep = CutDependency(kind="define", name=func_lc)
+                    dep = self._get_define_dep(func_lc, dn["body"], visited+[func_lc], depth)
                     parent.children.append(dep)
-                    self._build_children(dn["body"], dep, visited+[func_lc], depth+1)
                     return
             for p in expr.get("params", []):
                 self._build_children(p, parent, visited, depth+1)
@@ -1063,10 +1248,87 @@ class DefineResolver:
             if expr.get("else"):
                 self._build_children(expr["else"], parent, visited, depth+1)
 
+    # ── cached node construction ─────────────────────────────────────────────
+
+    def _get_define_dep(self, name_lc: str, body: dict,
+                        visited_for_body: List[str], depth: int) -> DefineDependency:
+        """Build (once) and cache the DefineDependency subtree for a
+        define, shared by reference across every reference site."""
+        cached = self._define_dep_cache.get(name_lc)
+        if cached is not None:
+            return cached
+        dep = DefineDependency(name=name_lc)
+        self._build_children(body, dep, visited_for_body, depth+1)
+        self._define_dep_cache[name_lc] = dep
+        return dep
+
+    def _get_builtin_dep(self, name: str) -> BuiltinDependency:
+        """Builtins are stateless terminal leaves — one shared instance
+        per canonical name is always safe."""
+        cached = self._builtin_dep_cache.get(name)
+        if cached is not None:
+            return cached
+        dep = BuiltinDependency(name=name)
+        self._builtin_dep_cache[name] = dep
+        return dep
+
+    def _get_region_ref_dep(self, region_id: str, reg: RegionIR) -> DefineDependency:
+        """Build (once) and cache the wrapper node for a nested-region
+        reference. The nested cuts' own dependency trees are grafted by
+        reference regardless (as before) — only the wrapper node itself
+        is now shared rather than rebuilt per reference site."""
+        key = region_id.lower()
+        cached = self._region_dep_cache.get(key)
+        if cached is not None:
+            return cached
+        dep = DefineDependency(name=f"region:{region_id}")
+        for nested_rc in reg.resolved_cuts:
+            if nested_rc.dependency_tree is not None:
+                dep.children.append(nested_rc.dependency_tree)
+        # Only cache a populated stub. A region referenced before its own
+        # cuts are resolved (only possible now through a cycle, since
+        # extract_ir resolves regions parents-first) would otherwise be
+        # cached EMPTY and every later reference would get the empty one.
+        if reg.resolved_cuts:
+            self._region_dep_cache[key] = dep
+        return dep
+
     def _build_object_dep(self, obj: ObjectIR, visited: List[str],
-                          depth: int) -> Optional[CutDependency]:
+                          depth: int) -> Optional[ObjectDependency]:
+        """Build (once) and cache this object's ObjectDependency subtree.
+
+        Cached by lowercased object name: every reference site (another
+        object's ``take``, a region cut, another define) that reaches
+        the same object gets back the SAME node by reference, instead of
+        a freshly-rebuilt, structurally-equal copy. This is the fix for
+        the redundant subtree rebuilding (and repeated
+        ``retag_constraint_expr`` calls) that used to happen once per
+        reference site.
+
+        ``obj.own_cuts`` is resolved lazily, on first build, mirroring
+        what the old (now-removed) ``InheritanceChainBuilder._build_chain``
+        did — this method is now the single place that both resolves an
+        object's own SELECT/REJECT cuts and builds its dependency
+        subtree, replacing the two separate, parallel mechanisms
+        (``_build_object_dep`` and ``InheritanceChainBuilder``) that used
+        to compute overlapping information independently. See
+        ``_resolving_own_cuts`` for the re-entrancy guard this requires.
+        """
+        key = obj.name.lower()
+        cached = self._object_dep_cache.get(key)
+        if cached is not None:
+            return cached
         if depth > self.MAX_DEPTH:
             return None
+
+        if not obj.own_cuts and key not in self._resolving_own_cuts:
+            raw_cmds: List[dict] = getattr(obj, "_raw_cmds_store", [])
+            if raw_cmds:
+                self._resolving_own_cuts.add(key)
+                try:
+                    obj.own_cuts = self.resolve_cuts(raw_cmds)
+                finally:
+                    self._resolving_own_cuts.discard(key)
 
         # Aggregate the structured forms of every cut in this object,
         # retagged with object provenance. Preserving the boolean shape
@@ -1074,23 +1336,36 @@ class DefineResolver:
         # correct per-axis acceptance — losing it would reintroduce the
         # union-as-intersection bug for object-level cuts inherited via
         # the dependency tree.
+        #
+        # Each retagged leaf's LOCAL ``define_chain`` is stamped exactly
+        # once, right here, to just this object's own name (e.g.
+        # ["jets"]) — never touched again afterwards. This is safe
+        # because these are brand-new CutStructure copies produced by
+        # ``retag_constraint_expr`` a few lines above, not yet observed
+        # or shared anywhere; it is a one-time local write, not a later
+        # re-stamp of an already-shared leaf (which is what made the old
+        # ``_stamp_chains_from_tree`` unsafe once nodes are cached). The
+        # OUTER chain — this object's position within any particular
+        # cut's own tree — is computed separately, per cut, without
+        # mutation, by ``_compute_leaf_chains``.
         own_exprs: List[ConstraintExpr] = []
         for rc in obj.own_cuts:
             if constraint_expr_leaves(rc.constraint_expr):
-                own_exprs.append(retag_constraint_expr(
+                retagged = retag_constraint_expr(
                     rc.constraint_expr, "object", obj.name,
-                ))
+                )
+                for leaf in constraint_expr_leaves(retagged):
+                    leaf.define_chain = [obj.name]
+                own_exprs.append(retagged)
 
-        dep = CutDependency(
-            kind="object", name=obj.name,
+        dep = ObjectDependency(
+            name=obj.name,
             own_constraint_exprs=own_exprs,
         )
         for parent_name in obj.takes:
             new_vis = visited + [obj.name.lower()]
             if parent_name.upper() in BUILTIN_OBJECTS:
-                dep.children.append(
-                    CutDependency(kind="builtin", name=canonicalise(parent_name))
-                )
+                dep.children.append(self._get_builtin_dep(canonicalise(parent_name)))
             else:
                 parent_obj = self.ir.get_object(parent_name)
                 if parent_obj is not None and parent_name.lower() not in visited:
@@ -1098,9 +1373,9 @@ class DefineResolver:
                     if child:
                         dep.children.append(child)
                 else:
-                    dep.children.append(
-                        CutDependency(kind="builtin", name=parent_name.upper())
-                    )
+                    dep.children.append(self._get_builtin_dep(parent_name.upper()))
+
+        self._object_dep_cache[key] = dep
         return dep
 
     # ── expression resolution ─────────────────────────────────────────────────
@@ -1132,6 +1407,7 @@ class DefineResolver:
                         dotop=dotop or sub.get("dotop", ""),
                         accessor=sub.get("accessor", []),
                         type=sub.get("type", ""),
+                        src_object=sub.get("src_object", ""),
                     )
                 return sub
             obj = self.ir.get_object(expr["id"])
@@ -1139,8 +1415,20 @@ class DefineResolver:
                 root = obj.root_type()
                 if root != "UNKNOWN":
                     acc = expr.get("accessor", [])
+                    # Keep ``id`` as the canonical builtin root (existing
+                    # code — builtin detection, roots(), display fallback
+                    # — depends on it being e.g. "JET"), but stamp
+                    # ``src_object`` with the ACTUAL referenced object's
+                    # own name. Two different objects sharing a root
+                    # (``jets`` and ``nonbjets``, both rooted at JET) must
+                    # stay distinguishable once substituted, or a cut like
+                    # ``dR(ELE, nonbjets)`` and another like
+                    # ``dR(ELE, jets)`` collapse onto the identical
+                    # signature ``dr(ELE, JET)`` and get wrongly treated
+                    # as constraints on the SAME axis (see IdNode.signature
+                    # in expr_node.py for where this is consumed).
                     return _make_var(id=root, dotop=expr.get("dotop", ""),
-                                     accessor=acc)
+                                     accessor=acc, src_object=obj.name)
             return expr
 
         if tok == "FUNCTION":
@@ -1186,71 +1474,142 @@ class DefineResolver:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# InheritanceChainBuilder
-# ─────────────────────────────────────────────────────────────────────────────
-
-class InheritanceChainBuilder:
-    def __init__(self, ir: AnalysisIR, resolver: DefineResolver):
-        self.ir = ir
-        self.resolver = resolver
-        self._cache: Dict[str, ObjectInheritanceChain] = {}
-
-    def build_all(self):
-        for name in list(self.ir.objects.keys()):
-            self.ir.objects[name].chain = self._build_chain(name, [])
-
-    def _build_chain(self, name: str, visited: List[str]) -> ObjectInheritanceChain:
-        if name in self._cache:
-            return self._cache[name]
-        if name in visited:
-            ch = ObjectInheritanceChain()
-            ch.levels.append(InheritanceLevel(name=name, is_builtin=False))
-            return ch
-        if name.upper() in BUILTIN_OBJECTS:
-            ch = ObjectInheritanceChain()
-            ch.levels.append(InheritanceLevel(name=name.upper(), is_builtin=True))
-            self._cache[name] = ch
-            return ch
-        obj = self.ir.get_object(name)
-        if obj is None:
-            ch = ObjectInheritanceChain()
-            ch.levels.append(InheritanceLevel(name=name, is_builtin=False))
-            self._cache[name] = ch
-            return ch
-
-        raw_cmds: List[dict] = getattr(obj, "_raw_cmds_store", [])
-        own_resolved = self.resolver.resolve_cuts(raw_cmds)
-        obj.own_cuts = own_resolved
-
-        # Build this object's level. Only the structured form is stored;
-        # the flat-leaf view is derived on demand by InheritanceLevel.cuts.
-        # One ConstraintExpr per source-level cut preserves AND/OR shape
-        # for the IntervalSet evaluator.
-        level = InheritanceLevel(name=obj.name, is_builtin=False)
-        for rc in own_resolved:
-            if constraint_expr_leaves(rc.constraint_expr):
-                level.constraint_exprs.append(rc.constraint_expr)
-
-        chain = ObjectInheritanceChain()
-        chain.levels.append(level)
-
-        for parent_name in obj.takes:
-            parent_chain = self._build_chain(parent_name, visited+[name])
-            chain.levels.extend(parent_chain.levels)
-            if len(obj.takes) > 1:
-                chain.levels[0] = InheritanceLevel(
-                    name=obj.name+"[UNION]", is_builtin=False,
-                    constraint_exprs=level.constraint_exprs,
-                )
-                break
-
-        self._cache[name] = chain
-        return chain
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Main extraction
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Region inheritance
+# ─────────────────────────────────────────────────────────────────────────────
+# Grammar fact (parser.y, ``criterion : id``): a bare ``presel`` line in a
+# region is desugared by the C++ parser into ``SELECT ID(presel)`` — so it
+# reaches Python indistinguishable from ``select presel``, and one rule
+# covers both spellings. ``select ALL`` arrives as ``SELECT ID(ALL)``.
+#
+# Name priority mirrors DefineResolver._build_children: a define or object
+# with the same name shadows a region.
+
+def _region_key(ir: AnalysisIR, name: str) -> Optional[str]:
+    """Canonical (as-declared) region name for ``name``, case-insensitive."""
+    if name in ir.regions:
+        return name
+    nl = name.lower()
+    return next((k for k in ir.regions if k.lower() == nl), None)
+
+
+def _shadowed_by_define_or_object(ir: AnalysisIR, name: str) -> bool:
+    return ir.get_define(name.lower()) is not None or ir.get_object(name) is not None
+
+
+def _region_refs_in(ir: AnalysisIR, expr: Optional[dict]) -> List[str]:
+    """Every region named anywhere inside an expression (canonical names)."""
+    out: List[str] = []
+    if not isinstance(expr, dict):
+        return out
+    tok = _tok(expr)
+    if tok == "ID":
+        nm = expr.get("id", "")
+        if nm and not _shadowed_by_define_or_object(ir, nm):
+            key = _region_key(ir, nm)
+            if key is not None:
+                out.append(key)
+        return out
+    for k in ("lhs", "rhs", "condition", "then", "else"):
+        out += _region_refs_in(ir, expr.get(k))
+    for p in expr.get("params", []) or []:
+        out += _region_refs_in(ir, p)
+    return out
+
+
+def _classify_region_line(ir: AnalysisIR, cmd: dict) -> Tuple[str, str, str]:
+    """Return ``(role, ref, note)`` for one raw region command.
+
+    role ∈ {"own", "inherit", "all", "opaque"} — see ResolvedCutIR.region_role.
+    """
+    tok = (cmd.get("tok") or "").upper()
+    cond = cmd.get("condition")
+    bare = _is_var(cond) and not cond.get("accessor") and not cond.get("dotop")
+
+    if bare:
+        nm = cond.get("id", "")
+        if nm and not _shadowed_by_define_or_object(ir, nm):
+            key = _region_key(ir, nm)
+            if key is not None:
+                if tok == "SELECT":
+                    return ("inherit", key, "")
+                return ("opaque", key,
+                        f"`{tok.lower()} {key}` (negated region reference) is not "
+                        f"modelled; this line contributes OVERLAP.")
+            if nm.upper() == "ALL":
+                if tok == "SELECT":
+                    return ("all", "", "")
+                return ("opaque", "",
+                        f"`{tok.lower()} ALL` rejects every event; not modelled, "
+                        f"this line contributes OVERLAP.")
+            if nm.upper() not in BUILTIN_OBJECTS:
+                return ("opaque", nm,
+                        f"`{nm}` is not a known region, object or define "
+                        f"(possible typo?); this line contributes OVERLAP.")
+
+    refs = _region_refs_in(ir, cond)
+    if refs:
+        return ("opaque", refs[0],
+                f"Region `{refs[0]}` is used inside a compound condition; only a "
+                f"plain `select {refs[0]}` / bare `{refs[0]}` line is inherited. "
+                f"This line contributes OVERLAP.")
+    return ("own", "", "")
+
+
+def _region_resolution_order(
+    ir: AnalysisIR, raw_parents: Dict[str, List[str]],
+) -> Tuple[List[str], Set[Tuple[str, str]]]:
+    """Parents-first (post-order DFS) order over the region graph, plus
+    the set of ``(child, parent)`` edges that close a cycle. Resolving in
+    this order means file order no longer matters: a child written above
+    its parent still sees the parent's cuts."""
+    state: Dict[str, int] = {}          # 0 = on stack, 1 = done
+    order: List[str] = []
+    back_edges: Set[Tuple[str, str]] = set()
+
+    def visit(n: str):
+        state[n] = 0
+        for p in raw_parents.get(n, []):
+            st = state.get(p)
+            if st == 0:
+                back_edges.add((n, p))
+            elif st is None:
+                visit(p)
+        state[n] = 1
+        order.append(n)
+
+    for n in ir.regions:
+        if n not in state:
+            visit(n)
+    return order, back_edges
+
+
+def _flatten_region(ir: AnalysisIR, reg: RegionIR) -> None:
+    """Fill ``reg.effective_cuts`` / ``reg.cut_origins``: ancestors' cuts
+    first (each shared ancestor once), then this region's own cuts."""
+    out: List[ResolvedCutIR] = []
+    origins: Dict[int, Tuple[str, ...]] = {}
+    seen: Set[int] = set()
+
+    def walk(r: RegionIR, path: Tuple[str, ...], stack: Set[str]):
+        for p in r.parents:
+            if p in stack:              # defensive; cycle edges are pruned already
+                continue
+            walk(ir.regions[p], (p,) + path, stack | {p})
+        for rc in r.own_cuts:
+            if id(rc) in seen:
+                continue
+            seen.add(id(rc))
+            out.append(rc)
+            origins[id(rc)] = path
+
+    walk(reg, (), {reg.name})
+    reg.effective_cuts = out
+    reg.cut_origins = origins
+
 
 def extract_ir(ast_nodes: list, source_file: str = "<unknown>") -> AnalysisIR:
     ir = AnalysisIR(source_file=source_file)
@@ -1288,12 +1647,48 @@ def extract_ir(ast_nodes: list, source_file: str = "<unknown>") -> AnalysisIR:
             ir.regions[node["id"]] = reg
 
     resolver = DefineResolver(ir)
-    chain_builder = InheritanceChainBuilder(ir, resolver)
-    chain_builder.build_all()
 
-    for reg in ir.regions.values():
+    # Build (and cache) each object's own dependency tree. This also
+    # lazily resolves each object's own SELECT/REJECT cuts on first
+    # build (see DefineResolver._build_object_dep) — replacing the old,
+    # separate InheritanceChainBuilder pass that used to do both jobs
+    # independently of _build_object_dep.
+    for name, obj in ir.objects.items():
+        obj.chain = resolver._build_object_dep(obj, [], 0)
+
+    # Region inheritance. Classification only needs names, so it runs on
+    # the raw commands before anything is resolved — that's what lets us
+    # resolve regions parents-first regardless of file order.
+    raw_roles: Dict[str, List[Tuple[str, str, str]]] = {}
+    raw_parents: Dict[str, List[str]] = {}
+    for name, reg in ir.regions.items():
+        raw = getattr(reg, "_raw_cmds_store", [])
+        roles = [_classify_region_line(ir, cmd) for cmd in raw]
+        raw_roles[name] = roles
+        raw_parents[name] = [ref for role, ref, _ in roles if role == "inherit"]
+
+    order, back_edges = _region_resolution_order(ir, raw_parents)
+
+    for name in order:
+        reg = ir.regions[name]
         raw = getattr(reg, "_raw_cmds_store", [])
         reg.resolved_cuts = resolver.resolve_cuts(raw)
+        for rc, (role, ref, note) in zip(reg.resolved_cuts, raw_roles[name]):
+            if role == "inherit" and (name, ref) in back_edges:
+                role = "opaque"
+                note = (f"`select {ref}` closes an inheritance cycle "
+                        f"({name} → … → {ref} → {name}); the edge is ignored "
+                        f"and this line contributes OVERLAP.")
+            rc.region_role, rc.region_ref, rc.region_note = role, ref, note
+            if role == "inherit":
+                reg.parents.append(ref)
+            elif role == "all":
+                reg.has_all_marker = True
+            elif role == "opaque":
+                reg.warnings.append(note)
+
+    for reg in ir.regions.values():
+        _flatten_region(ir, reg)
 
     for name, dn in ir.defines_raw.items():
         resolved_expr = resolver._resolve_expr(dn["body"], [], 0)
