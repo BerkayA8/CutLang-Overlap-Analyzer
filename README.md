@@ -71,3 +71,97 @@ The binary `Overlap_pipeline/adl_to_json` is found automatically when the script
 ```bash
 export ADL_TO_JSON=/path/to/adl_to_json
 ```
+
+---
+
+## Example: self-comparison of published ATLAS analyses
+
+These examples use ADL files from the [ADL4Reinterpretation](https://github.com/ADL4HEP/ADL4Reinterpretation) repository. Each analysis is compared **with itself**: the same file is passed twice, so every signal region in the analysis is checked against every other signal region of that same analysis. This shows which regions are disjoint, which overlap, and which are nested (SUBSET / SUPERSET). Every region compared with itself should come out EQUAL, which is a useful sanity check.
+
+| Analysis | Title | arXiv | Lumi (fb⁻¹) |
+|---|---|---|---|
+| ATLAS-SUSY-2015-06 | Squarks and gluinos, jets + missing transverse momentum | [1605.03814](https://arxiv.org/abs/1605.03814) | 3.2 |
+| ATLAS-SUSY-2016-07 | Squarks and gluinos, jets + missing transverse momentum | [1712.02332](https://arxiv.org/abs/1712.02332) | 36.1 |
+| ATLAS-SUSY-2018-09 | Squarks and gluinos, same-sign leptons + jets | [1909.08457](https://arxiv.org/abs/1909.08457) | 139 |
+| ATLAS-SUSY-2018-22 | Squarks and gluinos, jets + missing transverse momentum (BDT regions not included) | [2010.14293](https://arxiv.org/abs/2010.14293) | 139 |
+
+### 1. Get the ADL files
+
+Clone the repository into the project root (next to the `Makefile`):
+
+```bash
+git clone https://github.com/ADL4HEP/ADL4Reinterpretation.git
+```
+
+The files used below are:
+
+```
+ADL4Reinterpretation/ATLAS-SUSY-2015-06/ATLAS-SUSY-2015-06_Delphes.adl
+ADL4Reinterpretation/ATLAS-SUSY-2016-07/ATLAS-SUSY-2016-07_Delphes.adl
+ADL4Reinterpretation/ATLAS-SUSY-2018-09/ATLAS-SUSY-2018-09_Delphes.adl
+ADL4Reinterpretation/ATLAS-SUSY-2018-22/ATLAS-SUSY-2018-22_Delphes.adl
+```
+
+### 2. Build the parser
+
+```bash
+make
+```
+
+### 3. Run each self-comparison
+
+Each command compares one analysis with itself and writes its own HTML report.
+
+**ATLAS-SUSY-2015-06**
+
+```bash
+make run ADLS="ADL4Reinterpretation/ATLAS-SUSY-2015-06/ATLAS-SUSY-2015-06_Delphes.adl \
+               ADL4Reinterpretation/ATLAS-SUSY-2015-06/ATLAS-SUSY-2015-06_Delphes.adl" \
+         HTML=ATLAS-SUSY-2015-06_self.html
+```
+
+**ATLAS-SUSY-2016-07**
+
+```bash
+make run ADLS="ADL4Reinterpretation/ATLAS-SUSY-2016-07/ATLAS-SUSY-2016-07_Delphes.adl \
+               ADL4Reinterpretation/ATLAS-SUSY-2016-07/ATLAS-SUSY-2016-07_Delphes.adl" \
+         HTML=ATLAS-SUSY-2016-07_self.html
+```
+
+**ATLAS-SUSY-2018-09**
+
+```bash
+make run ADLS="ADL4Reinterpretation/ATLAS-SUSY-2018-09/ATLAS-SUSY-2018-09_Delphes.adl \
+               ADL4Reinterpretation/ATLAS-SUSY-2018-09/ATLAS-SUSY-2018-09_Delphes.adl" \
+         HTML=ATLAS-SUSY-2018-09_self.html
+```
+
+**ATLAS-SUSY-2018-22**
+
+```bash
+make run ADLS="ADL4Reinterpretation/ATLAS-SUSY-2018-22/ATLAS-SUSY-2018-22_Delphes.adl \
+               ADL4Reinterpretation/ATLAS-SUSY-2018-22/ATLAS-SUSY-2018-22_Delphes.adl" \
+         HTML=ATLAS-SUSY-2018-22_self.html
+```
+
+Add `VERBOSE=1` to see the per-variable cut details in the terminal, or `CATALOGUE=1` to print the object catalogue of the analysis.
+
+### Running all four at once
+
+```bash
+for ID in ATLAS-SUSY-2015-06 ATLAS-SUSY-2016-07 ATLAS-SUSY-2018-09 ATLAS-SUSY-2018-22; do
+    F="ADL4Reinterpretation/${ID}/${ID}_Delphes.adl"
+    make run ADLS="$F $F" HTML="${ID}_self.html"
+done
+```
+
+Or with the Python script directly:
+
+```bash
+for ID in ATLAS-SUSY-2015-06 ATLAS-SUSY-2016-07 ATLAS-SUSY-2018-09 ATLAS-SUSY-2018-22; do
+    F="ADL4Reinterpretation/${ID}/${ID}_Delphes.adl"
+    python3 Overlap_pipeline/adl_overlap_check.py "$F" "$F" --html "${ID}_self.html"
+done
+```
+
+Each run produces one `<ID>_self.html` report in the project root.

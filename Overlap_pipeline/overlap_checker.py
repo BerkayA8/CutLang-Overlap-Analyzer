@@ -797,7 +797,34 @@ def _restricted_cumulative(node: CutDependency, root: str) -> ConstraintExpr:
     return ConstraintAnd(tuple(parts))
 
 
+# Containment prover for cuts outside the interval model (overlap removal
+# with allof() and pT-dependent ΔR windows); set by compare().
+_PROVER = None
+
+
 def _compare_object_subtrees(
+    obj_a: CutDependency, obj_b: CutDependency,
+    var_overlaps_out: Optional[List[VariableOverlap]] = None,
+) -> str:
+    """The interval comparison below, strengthened by object_containment:
+    a containment it proves (A ⊆ B, B ⊆ A) is added to the verdict."""
+    v = _compare_object_subtrees_base(obj_a, obj_b, var_overlaps_out)
+    if (v in (EQUAL, DISJOINT) or _PROVER is None
+            or not isinstance(obj_a, ObjectDependency)
+            or not isinstance(obj_b, ObjectDependency)):
+        return v
+    a_in_b = v == SUBSET or _PROVER.subset(obj_a.name, obj_b.name)
+    b_in_a = v == SUPERSET or _PROVER.subset(obj_b.name, obj_a.name)
+    if a_in_b and b_in_a:
+        return EQUAL
+    if a_in_b:
+        return SUBSET
+    if b_in_a:
+        return SUPERSET
+    return v
+
+
+def _compare_object_subtrees_base(
     obj_a: CutDependency, obj_b: CutDependency,
     var_overlaps_out: Optional[List[VariableOverlap]] = None,
 ) -> str:
@@ -900,12 +927,53 @@ def _compare_object_subtrees(
     if all(v == DISJOINT for v in common_relations):
         return DISJOINT
     if not only_in_a and not only_in_b and all(v == EQUAL for v in common_relations):
-        return EQUAL
-    if not only_in_a and all(v in (EQUAL, SUBSET) for v in common_relations):
-        return SUBSET
-    if not only_in_b and all(v in (EQUAL, SUPERSET) for v in common_relations):
-        return SUPERSET
-    return OVERLAP
+        verdict = EQUAL
+    elif not only_in_a and all(v in (EQUAL, SUBSET) for v in common_relations):
+        verdict = SUBSET
+    elif not only_in_b and all(v in (EQUAL, SUPERSET) for v in common_relations):
+        verdict = SUPERSET
+    else:
+        return OVERLAP
+    return _adjust_for_dropped(verdict, _cumulative_dropped(obj_a), _cumulative_dropped(obj_b))
+
+
+def _cumulative_dropped(node: CutDependency) -> List[str]:
+    """Comparisons left out of the model of an object and of all its parents
+    (see ir_extractor._DROPPED_SINK), with object names canonicalised."""
+    import re as _re
+    from expr_node import SRC_OBJECT_ALIASES as _al
+    out: List[str] = []
+    seen = set()
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if id(n) in seen:
+            continue
+        seen.add(id(n))
+        for d in getattr(n, "dropped", []) or []:
+            out.append(_re.sub(r"[A-Za-z_][A-Za-z0-9_]*",
+                               lambda m: _al.get(m.group(0).lower(), m.group(0).lower()), d))
+        stack.extend(ch for ch in getattr(n, "children", []) if isinstance(ch, ObjectDependency))
+    return sorted(out)
+
+
+def _adjust_for_dropped(verdict: str, dropped_a: List[str], dropped_b: List[str]) -> str:
+    """The model of each side is looser than the real selection when cuts were
+    dropped. Identical dropped cuts on both sides restrict both sets in the
+    same way and cancel. Otherwise only the directions that remain true are
+    kept: a side with extra unmodelled cuts can only be smaller than modelled."""
+    a, b = list(dropped_a), list(dropped_b)
+    for d in list(a):
+        if d in b:
+            a.remove(d)
+            b.remove(d)
+    if verdict == DISJOINT or (not a and not b):
+        return verdict
+    if a and b:
+        return OVERLAP
+    if a:   # real A ⊆ model A
+        return {EQUAL: SUBSET, SUBSET: SUBSET}.get(verdict, OVERLAP)
+    return {EQUAL: SUPERSET, SUPERSET: SUPERSET}.get(verdict, OVERLAP)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1048,9 +1116,24 @@ def _compare_compound_nodes(
         in_a = a_by_root.get(root) or []
         in_b = b_by_root.get(root) or []
         if in_a and in_b:
-            for oa in in_a:
-                for ob in in_b:
-                    contribs.append(_compare_object_subtrees(oa, ob))
+            m = [[_compare_object_subtrees(oa, ob) for ob in in_b] for oa in in_a]
+            # Several objects under one root on both sides (e.g. the
+            # positive and the negative leptons of ``size(lepPos) >= 2 or
+            # size(lepNeg) >= 2``): if they match one-to-one as EQUAL, the
+            # children are the same and the cross pairs carry no information.
+            import itertools as _it
+            if len(in_a) == len(in_b) and len(in_a) > 1 and any(
+                    all(m[i][p[i]] == EQUAL for i in range(len(in_a)))
+                    for p in _it.permutations(range(len(in_b)))):
+                contribs.extend([EQUAL] * len(in_a))
+            else:
+                for row in m:
+                    # A DISJOINT relation between two *objects* (e.g.
+                    # positive vs negative leptons) does not make the two
+                    # *cuts* exclusive: an event can satisfy a condition on
+                    # each collection at the same time. Only the interval
+                    # comparison of the leaves (above) may prove DISJOINT.
+                    contribs.extend(OVERLAP if r == DISJOINT else r for r in row)
         elif in_a:
             contribs.append(SUBSET)
         else:
@@ -2037,6 +2120,39 @@ def _leaf_branches(node: CutDependency, _path: frozenset = frozenset(), _depth: 
     return out
 
 
+def _branch_dropped(names: frozenset, ir_nodes: Dict[str, CutDependency]) -> List[str]:
+    """Unmodelled (dropped) cuts of the objects on a branch path."""
+    out: List[str] = []
+    for n in names:
+        node = ir_nodes.get(n)
+        if node is not None:
+            out += _cumulative_dropped_own(node)
+    return sorted(out)
+
+
+def _cumulative_dropped_own(node: CutDependency) -> List[str]:
+    import re as _re
+    from expr_node import SRC_OBJECT_ALIASES as _al
+    return [_re.sub(r"[A-Za-z_][A-Za-z0-9_]*",
+                    lambda m: _al.get(m.group(0).lower(), m.group(0).lower()), d)
+            for d in (getattr(node, "dropped", []) or [])]
+
+
+def _object_nodes_by_name(*trees) -> Dict[str, CutDependency]:
+    found: Dict[str, CutDependency] = {}
+    stack = list(trees)
+    while stack:
+        n = stack.pop()
+        if n is None:
+            continue
+        if isinstance(n, ObjectDependency):
+            if n.name.lower() in found:
+                continue
+            found[n.name.lower()] = n
+        stack.extend(getattr(n, "children", []) or [])
+    return found
+
+
 def _flatten_conjuncts(exprs) -> List[ConstraintExpr]:
     out: List[ConstraintExpr] = []
     for e in exprs:
@@ -2119,6 +2235,16 @@ def _branch_implies(sub_conj: List[ConstraintExpr], sub_names: frozenset,
     return False
 
 
+def _prover_branch_in(root, names, xroot, xnames) -> bool:
+    """object_containment fallback: the branch (root, names) of one object
+    lies in the branch (xroot, xnames) of another."""
+    if _PROVER is None or root != xroot:
+        return False
+    b = _PROVER.branch_by_path(root, names)
+    xb = _PROVER.branch_by_path(xroot, xnames)
+    return b is not None and xb is not None and _PROVER.branch_implies(b[2], xb[2])
+
+
 def _prove_cardinality_disjoint(reg_a: RegionIR, reg_b: RegionIR) -> Optional[str]:
     """A human-readable proof that no event passes both regions, using the
     cardinality bounds described above; None if no such proof is found.
@@ -2151,6 +2277,23 @@ def _prove_cardinality_disjoint(reg_a: RegionIR, reg_b: RegionIR) -> Optional[st
         if brs_all:
             containers.append((bd.hi, f"{bd.side}: {bd.label}", brs_all))
 
+    # Unmodelled cuts (see ir_extractor._DROPPED_SINK): a container branch
+    # with extra unmodelled cuts can be smaller than modelled, so a Z branch
+    # is only proven to lie in it if the Z branch carries the same cuts.
+    _nodes = _object_nodes_by_name(
+        *[rc.dependency_tree for rc in _collect_region_cuts(reg_a)],
+        *[rc.dependency_tree for rc in _collect_region_cuts(reg_b)])
+
+    def _dropped_ok(sub_names, sup_names) -> bool:
+        need = _branch_dropped(sup_names, _nodes)
+        have = _branch_dropped(sub_names, _nodes)
+        for d in need:
+            if d in have:
+                have.remove(d)
+            else:
+                return False
+        return True
+
     for bd in bounds:
         if bd.lo < 1:
             continue
@@ -2166,6 +2309,8 @@ def _prove_cardinality_disjoint(reg_a: RegionIR, reg_b: RegionIR) -> Optional[st
                 cands = [ci for ci, (_c, _l, cbrs) in enumerate(containers)
                          if any(xr == r and all(_branch_implies(conj, names, req, xn)
                                                 for req in xconj)
+                                and _dropped_ok(names, xn)
+                                or _prover_branch_in(r, names, xr, xn)
                                 for xr, xconj, xn in cbrs)]
                 if not cands:
                     ok = False
@@ -2389,6 +2534,63 @@ def _all_builtins_in_ir(ir: AnalysisIR) -> Set[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compare(
+    ir_a: AnalysisIR, ir_b: AnalysisIR,
+) -> OverlapReport:
+    import expr_node as _en
+    from object_containment import ObjectProver
+    global _PROVER
+    _en.SRC_OBJECT_ALIASES.clear()
+    _PROVER = ObjectProver(ir_a, ir_b)
+    try:
+        _en.SRC_OBJECT_ALIASES.update(_equal_object_aliases(ir_a, ir_b))
+        return _compare_impl(ir_a, ir_b)
+    finally:
+        _en.SRC_OBJECT_ALIASES.clear()
+        _PROVER = None
+
+
+def _equal_object_aliases(ir_a: AnalysisIR, ir_b: AnalysisIR) -> Dict[str, str]:
+    """Canonical names for objects proven EQUAL across the two analyses.
+
+    Signatures of cuts embed the referenced object's name (IdNode.src_object),
+    so identical definitions written under different names (``cleanJets`` in
+    one file, ``s16cleanJets`` in the other) never matched, and nothing that
+    depends on them (overlap removal, multiplicity cuts) could be compared.
+    Objects are compared bottom-up; whenever a pair is EQUAL, both names are
+    mapped to one representative and the comparison is repeated, so EQUAL
+    parents (jets, electrons) make their overlap-removed children comparable.
+    """
+    import expr_node as _en
+    parent: Dict[str, str] = {}
+
+    def find(x: str) -> str:
+        while parent.get(x, x) != x:
+            x = parent[x]
+        return x
+
+    pairs = [(oa, ob) for oa in ir_a.objects.values() for ob in ir_b.objects.values()
+             if oa.chain is not None and ob.chain is not None
+             and oa.root_type() != "UNKNOWN" and oa.root_type() == ob.root_type()
+             and oa.name.lower() != ob.name.lower()]
+    for _ in range(10):
+        changed = False
+        for oa, ob in pairs:
+            na, nb = find(oa.name.lower()), find(ob.name.lower())
+            if na == nb:
+                continue
+            if _compare_object_subtrees(oa.chain, ob.chain) == EQUAL:
+                rep, other = sorted((na, nb))
+                parent[other] = rep
+                changed = True
+        aliases = {n: find(n) for n in list(parent)}
+        _en.SRC_OBJECT_ALIASES.clear()
+        _en.SRC_OBJECT_ALIASES.update(aliases)
+        if not changed:
+            break
+    return {n: find(n) for n in list(parent)}
+
+
+def _compare_impl(
     ir_a: AnalysisIR, ir_b: AnalysisIR,
 ) -> OverlapReport:
     report = OverlapReport(analysis_a=ir_a.source_file, analysis_b=ir_b.source_file)

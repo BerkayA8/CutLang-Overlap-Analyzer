@@ -475,6 +475,19 @@ def _extract_func_chain_and_collection(
     return None
 
 
+# Comparisons that cannot be put on an interval (no numeric side, e.g.
+# ``dR(ele, allof(jets)) >= min(0.4, 0.04 + 10 / pT(ele))``) are left out of
+# the constraint tree. They are recorded here so that the comparator knows the
+# model of the cut (or object) is LOOSER than the real selection: that is
+# still sound for DISJOINT, but not for EQUAL/SUBSET/SUPERSET.
+_DROPPED_SINK: Optional[List[str]] = None
+
+
+def _note_dropped(expr: dict, negated: bool) -> None:
+    if _DROPPED_SINK is not None:
+        _DROPPED_SINK.append(("NOT " if negated else "") + _expr_repr(expr))
+
+
 def _build_constraint_expr(
     expr: dict,
     negated: bool,
@@ -525,10 +538,20 @@ def _build_constraint_expr(
         # Effective op flips under negation (De Morgan).
         effective_is_and = (op == "AND") ^ negated
         children: List[ConstraintExpr] = []
+        n_before = len(_DROPPED_SINK) if _DROPPED_SINK is not None else 0
         for side_key in ("lhs", "rhs"):
             sub = _build_constraint_expr(expr.get(side_key), negated, chain)
             if sub is not None:
                 children.append(sub)
+        if (not effective_is_and and _DROPPED_SINK is not None
+                and len(_DROPPED_SINK) > n_before):
+            # An OR with a branch that could not be modelled: keeping only
+            # the modelled branches would make the cut STRICTER than the
+            # real one (e.g. ``dR < 0.2 or dR >= f(pT)`` would become
+            # ``dR < 0.2``). Drop the whole OR instead (looser, recorded).
+            del _DROPPED_SINK[n_before:]
+            _note_dropped(expr, negated)
+            return None
         if not children:
             return None
         if len(children) == 1:
@@ -557,6 +580,7 @@ def _build_constraint_expr(
             )
             return ConstraintLeaf(cut)
         # Non-numeric on both sides: no extractable constraint.
+        _note_dropped(expr, negated)
         return None
 
     if tok in ("EXPROP", "FACTOROP"):
@@ -1100,9 +1124,15 @@ class DefineResolver:
         # The flat list view is derived on demand via the ``constraints``
         # property. ``ConstraintAnd(())`` is the identity element of
         # conjunction and stands in for "no extractable constraint".
-        ce = _build_constraint_expr(
-            resolved_expr, negated=is_reject, chain=[],
-        )
+        global _DROPPED_SINK
+        _prev_sink, _DROPPED_SINK = _DROPPED_SINK, []
+        try:
+            ce = _build_constraint_expr(
+                resolved_expr, negated=is_reject, chain=[],
+            )
+            rc.dropped = list(_DROPPED_SINK)
+        finally:
+            _DROPPED_SINK = _prev_sink
         rc.constraint_expr = ce if ce is not None else ConstraintAnd(())
 
         # Build dependency tree. The root carries the cut's structured
@@ -1389,6 +1419,7 @@ class DefineResolver:
             name=obj.name,
             own_constraint_exprs=own_exprs,
         )
+        dep.dropped = [d for rc in obj.own_cuts for d in getattr(rc, "dropped", [])]
         for parent_name in obj.takes:
             new_vis = visited + [obj.name.lower()]
             if parent_name.upper() in BUILTIN_OBJECTS:

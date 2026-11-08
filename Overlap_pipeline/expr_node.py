@@ -61,6 +61,11 @@ from dataclasses import dataclass, field
 from itertools import permutations
 from typing import List, Optional, Tuple
 
+# Canonical names for user-defined objects proven EQUAL in the current
+# comparison (lower-case name -> lower-case representative). Filled and
+# cleared by overlap_checker.compare(); empty means "no aliasing".
+SRC_OBJECT_ALIASES: dict = {}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Verdict lattice (mirrors overlap_checker.py — kept here to avoid circular
@@ -249,7 +254,12 @@ class IdNode(ExprNode):
     def signature(self) -> str:
         base = f"id:{self.collection.lower()}|{_accessor_token(self.accessor)}"
         if self.src_object:
-            return f"{base}~{self.src_object.lower()}"
+            name = self.src_object.lower()
+            # Objects proven EQUAL across the two analyses being compared
+            # share one canonical name (set by overlap_checker.compare), so
+            # identical definitions written under different names give
+            # identical signatures.
+            return f"{base}~{SRC_OBJECT_ALIASES.get(name, name)}"
         return base
 
     def full_signature(self) -> str:
