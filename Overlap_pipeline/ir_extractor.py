@@ -45,7 +45,7 @@ def _tok(node) -> str:
 def _is_num(node) -> bool:
     return _tok(node) in ("INT", "REAL")
 
-def _is_var(node) -> bool:  # variable
+def _is_var(node) -> bool:  # variable
     return _tok(node) == "ID"
 
 def _is_bin(node) -> bool:  # binary operator
@@ -796,6 +796,22 @@ class ObjectDependency(CutDependency):
         return ConstraintAnd(tuple(parts))
 
 
+def _collect_tree_roots(node: CutDependency, out: Set[str],
+                        _seen: Optional[Set[int]] = None) -> None:
+    """Add the built-in roots of every object/builtin node reachable from
+    ``node`` (through define and nested-region wrappers) to ``out``."""
+    if _seen is None:
+        _seen = set()
+    if id(node) in _seen:
+        return
+    _seen.add(id(node))
+    for ch in node.children:
+        if isinstance(ch, (ObjectDependency, BuiltinDependency)):
+            out |= ch.roots()
+        elif isinstance(ch, (DefineDependency, CutRootDependency)):
+            _collect_tree_roots(ch, out, _seen)
+
+
 # ANSI rendering constants used by ``CutDependency.pretty``. Module-level
 # so they're not rebuilt on every call during deep tree rendering.
 _PRETTY_KIND_LABELS = {"cut": "cut", "define": "def", "object": "obj", "builtin": "BLT"}
@@ -1102,6 +1118,17 @@ class DefineResolver:
         )
         self._build_children(condition, root_dep, [], 0)
         rc.dependency_tree = root_dep
+
+        # ``_resolve_expr`` substitutes an object reference with ONE
+        # representative root (``ObjectIR.root_type()``), so for a
+        # ``take Union(a, b)`` object spanning several roots (e.g. ELE and
+        # MUO) only the alphabetically-first root reached
+        # ``builtin_objects`` above. Rule 1 ("no shared built-in
+        # collections → DISJOINT") then saw a lepton-union cut as
+        # electron-only and could report a false DISJOINT against a
+        # muon-only region. Add every root of every object the cut
+        # depends on.
+        _collect_tree_roots(root_dep, rc.builtin_objects)
 
         # Compute this cut's own outer chain for every leaf reachable from
         # its root — WITHOUT mutating any leaf. See ResolvedCutIR.leaf_chains.

@@ -62,7 +62,7 @@ from ir_extractor import (
     BuiltinDependency, ObjectDependency,
     BUILTIN_OBJECTS, canonicalise,
 )
-from expr_node import compare_expr
+from expr_node import compare_expr, BinOpNode, FuncNode, IdNode
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5-value verdict lattice
@@ -1854,6 +1854,356 @@ def _compare_region_variables(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Rule 2b — cardinality-bound disjointness proof
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The per-variable pairing above compares ``size(X)`` with ``size(Y)`` only
+# when both land in the same signature bucket, and ``IdNode.src_object``
+# deliberately keeps differently-named objects in different buckets (pairing
+# them by interval alone would be unsound: ``size(X)==0`` vs ``size(Y)>=1`` is
+# NOT disjoint unless Y ⊆ X). So the classic veto pattern
+#
+#     A:  size(vetoEle) == 0, size(vetoMuo) == 0     (pT > 7)
+#     B:  size(Union(sigEle, sigMuo)) >= 1           (pT > 10)
+#
+# never got compared at all and fell through to SUBSET + SUPERSET → OVERLAP.
+# Proving it disjoint needs two things the bucket machinery can't do:
+#
+#   * decompose a Union into its branches — size(Union(a, b)) ≤ size(a)+size(b)
+#     — and bound each branch separately; and
+#   * use SEVERAL cuts of the other region together (the electron branch is
+#     killed by the electron veto, the muon branch by the muon veto; neither
+#     veto alone suffices).
+#
+# The proof, over every cardinality cut of both regions (an event in A∩B
+# satisfies all of them):
+#
+#   1. Upper bounds.  A cut ``size(X1) + … + size(Xn) <= u`` (also ``==``,
+#      ``<``) gives size(Xi) ≤ u for each term (counts are non-negative).
+#      Every leaf branch x of Xi (one built-in root plus the conjunction of
+#      element cuts on the path down to it) has size(x) ≤ size(Xi) ≤ u.
+#   2. Lower bounds.  For a cut ``size(Y1) + … + size(Ym) >= l`` (l ≥ 1),
+#      size(Yj) ≤ Σ over Yj's leaf branches b of size(b), and size(b) ≤ u
+#      whenever b ⊆ x for some upper-bounded branch x with the same root
+#      (b's element cuts imply x's). Unbounded branches count as ∞.
+#   3. If the summed upper bound is < l, no event can satisfy both → DISJOINT.
+#
+# Element cuts inside an object (``select pT(sigLep) > 20`` inside
+# ``hardLep``) are per-element properties regardless of which name the user
+# wrote, so they are keyed by function chain alone ("pt") when they refer to
+# the object itself or anything on its inheritance path; anything else
+# (indexed access, multi-argument functions, other collections) is keyed by
+# its full LHS signature and must match exactly. Every approximation errs
+# toward "no proof": a branch condition we can't interpret on the subset side
+# is dropped (makes b larger), and one we can't interpret on the superset
+# side blocks the implication.
+
+@dataclass
+class _CardinalityBound:
+    side: str                       # "A" or "B"
+    label: str                      # source-form cut text, for notes
+    terms: List[CutDependency]      # objects/builtins whose sizes are summed
+    lo: float                       # integer lower bound (≥ 0)
+    hi: float                       # integer upper bound (may be +inf)
+
+
+def _integer_hull(iv: IntervalSet) -> Optional[Tuple[float, float]]:
+    """Smallest [lo, hi] (non-negative integers, hi may be +inf) containing
+    every integer of ``iv``. None if ``iv`` holds no non-negative integer."""
+    lo: Optional[float] = None
+    hi: Optional[float] = None
+    for itv in iv.intervals:
+        il = 0.0 if itv.lo == -math.inf else float(math.ceil(itv.lo))
+        if itv.lo_open and il == itv.lo:
+            il += 1
+        il = max(il, 0.0)
+        if itv.hi == math.inf:
+            ih = math.inf
+        else:
+            ih = float(math.floor(itv.hi))
+            if itv.hi_open and ih == itv.hi:
+                ih -= 1
+        if ih < il:
+            continue
+        lo = il if lo is None else min(lo, il)
+        hi = ih if hi is None else max(hi, ih)
+    return None if lo is None else (lo, hi)
+
+
+def _find_object_node(tree: CutDependency, name: str,
+                      _seen: Optional[Set[int]] = None) -> Optional[CutDependency]:
+    """The ObjectDependency called ``name`` among ``tree``'s direct object
+    children or those reached through define wrappers."""
+    if _seen is None:
+        _seen = set()
+    if id(tree) in _seen:
+        return None
+    _seen.add(id(tree))
+    nl = name.lower()
+    for ch in tree.children:
+        if isinstance(ch, ObjectDependency) and ch.name.lower() == nl:
+            return ch
+    for ch in tree.children:
+        if isinstance(ch, DefineDependency):
+            hit = _find_object_node(ch, name, _seen)
+            if hit is not None:
+                return hit
+    return None
+
+
+def _cardinality_terms(lhs, tree: CutDependency) -> Optional[List[CutDependency]]:
+    """``size(X)`` or ``size(X) + size(Y) + …`` (whole collections only) →
+    the dependency nodes of X, Y, …; None for anything else."""
+    terms = list(lhs.children) if (isinstance(lhs, BinOpNode) and lhs.op == "+") else [lhs]
+    out: List[CutDependency] = []
+    for t in terms:
+        if not (isinstance(t, FuncNode)
+                and t.func_chain.lower() in _CARDINALITY_FUNCS
+                and len(t.args) == 1
+                and isinstance(t.args[0], IdNode)
+                and not t.args[0].accessor):
+            return None
+        idn: IdNode = t.args[0]
+        if idn.src_object:
+            node = _find_object_node(tree, idn.src_object)
+        elif idn.collection.upper() in BUILTIN_OBJECTS:
+            node = BuiltinDependency(name=canonicalise(idn.collection))
+        else:
+            node = None
+        if node is None:
+            return None
+        out.append(node)
+    return out
+
+
+def _collect_cardinality_bounds(reg: RegionIR, side: str) -> List[_CardinalityBound]:
+    """Integer bounds on every cardinality expression constrained by the
+    region. Cuts on the same expression are intersected first."""
+    by_sig: Dict[str, Tuple[List[ConstraintExpr], List[CutDependency], List[str]]] = {}
+    for rc in _collect_region_cuts(reg):
+        tree = rc.dependency_tree
+        if tree is None:
+            continue
+        for leaf in constraint_expr_leaves(rc.constraint_expr):
+            if _is_chi2_min_cut(leaf):
+                continue
+            terms = _cardinality_terms(leaf.lhs, tree)
+            if not terms:
+                continue
+            sig = leaf.lhs.signature()
+            entry = by_sig.setdefault(sig, ([], terms, []))
+            if not any(e is rc.constraint_expr for e in entry[0]):
+                entry[0].append(rc.constraint_expr)
+                entry[2].append(tree.name)
+    out: List[_CardinalityBound] = []
+    for sig, (exprs, terms, labels) in by_sig.items():
+        # Sound per-axis projection: an AND with other axes leaves this
+        # axis's restriction intact; an OR with another axis widens it to
+        # "everything" (no bound), never narrower than the truth.
+        hull = _integer_hull(evaluate_axis_for_exprs(exprs, sig))
+        if hull is None:
+            continue
+        out.append(_CardinalityBound(side, " ∧ ".join(labels), terms, hull[0], hull[1]))
+    return out
+
+
+def _leaf_branches(node: CutDependency, _path: frozenset = frozenset(), _depth: int = 0,
+                   ) -> Optional[List[Tuple[str, Tuple[ConstraintExpr, ...], frozenset]]]:
+    """Every built-in branch of an object: ``(root, element cuts on the
+    path, lowercased names on the path)``. None when any branch can't be
+    traced to a recognised built-in (unknown parent, empty object)."""
+    if _depth > 25:
+        return None
+    if isinstance(node, BuiltinDependency):
+        roots = node.roots()
+        if len(roots) != 1:
+            return None
+        r = next(iter(roots))
+        return [(r, (), _path | {r.lower(), node.name.lower()})]
+    if not isinstance(node, ObjectDependency):
+        return None
+    path = _path | {node.name.lower()}
+    parents = [ch for ch in node.children
+               if isinstance(ch, (ObjectDependency, BuiltinDependency))]
+    if not parents:
+        return None
+    out = []
+    for p in parents:
+        sub = _leaf_branches(p, path, _depth + 1)
+        if sub is None:
+            return None
+        for r, exprs, names in sub:
+            out.append((r, tuple(node.own_constraint_exprs) + exprs, names))
+    return out
+
+
+def _flatten_conjuncts(exprs) -> List[ConstraintExpr]:
+    out: List[ConstraintExpr] = []
+    for e in exprs:
+        if isinstance(e, ConstraintAnd):
+            out.extend(_flatten_conjuncts(e.children))
+        else:
+            out.append(e)
+    return out
+
+
+def _element_axis_key(cut: CutStructure, path_names: frozenset) -> Tuple[str, str]:
+    """Key identifying what an object-level cut measures. A single-argument
+    property of the element being filtered (``pT(this)``, ``abs∘eta(parent)``)
+    is keyed by its function chain alone, since the collection label on it
+    is just whichever name the user wrote. Everything else keeps its full
+    structural signature."""
+    lhs = cut.lhs
+    if (isinstance(lhs, FuncNode) and len(lhs.args) == 1
+            and isinstance(lhs.args[0], IdNode)
+            and not lhs.args[0].accessor
+            and lhs.func_chain.lower() not in _CARDINALITY_FUNCS):
+        idn: IdNode = lhs.args[0]
+        ref = (idn.src_object or idn.collection).lower()
+        if ref in path_names:
+            return ("elem", lhs.func_chain.lower())
+    return ("sig", lhs.signature())
+
+
+def _branch_interval(conjuncts: List[ConstraintExpr], key: Tuple[str, str],
+                     path_names: frozenset) -> IntervalSet:
+    """What a branch's own conjuncts allow on ``key``. Leaves and
+    single-axis ORs of leaves (``reject abs(eta) [] 1.37 1.52``) are used
+    exactly; anything else and ``~=`` leaves are ignored, which can only
+    widen the result (safe on the subset side of an implication)."""
+    iv = IntervalSet.everything()
+    for c in conjuncts:
+        if isinstance(c, ConstraintLeaf) and not _is_chi2_min_cut(c.cut):
+            if _element_axis_key(c.cut, path_names) == key:
+                iv = iv.intersect(IntervalSet.from_constraint(c.cut))
+        elif (isinstance(c, ConstraintOr) and c.children
+              and all(isinstance(k, ConstraintLeaf) and not _is_chi2_min_cut(k.cut)
+                      and _element_axis_key(k.cut, path_names) == key
+                      for k in c.children)):
+            union = IntervalSet.empty()
+            for k in c.children:
+                union = union.union(IntervalSet.from_constraint(k.cut))
+            iv = iv.intersect(union)
+    return iv
+
+
+def _branch_implies(sub_conj: List[ConstraintExpr], sub_names: frozenset,
+                    req: ConstraintExpr, sup_names: frozenset) -> bool:
+    """Does every element passing ``sub_conj`` also pass ``req``?"""
+    if isinstance(req, ConstraintLeaf):
+        if _is_chi2_min_cut(req.cut):
+            return False
+        key = _element_axis_key(req.cut, sup_names)
+        return IntervalSet.from_constraint(req.cut).contains_set(
+            _branch_interval(sub_conj, key, sub_names))
+    if isinstance(req, ConstraintAnd):
+        return all(_branch_implies(sub_conj, sub_names, ch, sup_names)
+                   for ch in req.children)
+    if isinstance(req, ConstraintOr):
+        if any(_branch_implies(sub_conj, sub_names, ch, sup_names)
+               for ch in req.children):
+            return True
+        # OR of leaves on one axis (e.g. ``reject abs(eta) [] 1.44 1.56``):
+        # implied if the branch's range on that axis fits inside the union.
+        kids = req.children
+        if kids and all(isinstance(k, ConstraintLeaf) and not _is_chi2_min_cut(k.cut)
+                        for k in kids):
+            keys = {_element_axis_key(k.cut, sup_names) for k in kids}
+            if len(keys) == 1:
+                union = IntervalSet.empty()
+                for k in kids:
+                    union = union.union(IntervalSet.from_constraint(k.cut))
+                return union.contains_set(
+                    _branch_interval(sub_conj, next(iter(keys)), sub_names))
+        return False
+    return False
+
+
+def _prove_cardinality_disjoint(reg_a: RegionIR, reg_b: RegionIR) -> Optional[str]:
+    """A human-readable proof that no event passes both regions, using the
+    cardinality bounds described above; None if no such proof is found.
+
+    Each upper-bounded cut is a *container* with capacity c (for
+    ``size(Y1)+…+size(Yn) <= c`` the capacity is shared by all its terms).
+    Every branch of the required collection Z must be assigned to a
+    container holding a superset branch of the same root. A container's
+    capacity is charged once for branches of distinct roots (an electron
+    is never a muon, so they are distinct elements of the container); n
+    branches of the SAME root assigned to one container are charged n·c,
+    since a Union of overlapping same-root objects may repeat elements.
+    The cheapest assignment gives the bound on size(Z).
+    """
+    bounds = (_collect_cardinality_bounds(reg_a, "A")
+              + _collect_cardinality_bounds(reg_b, "B"))
+    if not bounds:
+        return None
+
+    # containers: (capacity, label, [(root, conjuncts, path names)])
+    containers = []
+    for bd in bounds:
+        if bd.hi == math.inf:
+            continue
+        brs_all = []
+        for t in bd.terms:
+            brs = _leaf_branches(t)
+            if brs is not None:
+                brs_all += [(r, _flatten_conjuncts(e), n) for r, e, n in brs]
+        if brs_all:
+            containers.append((bd.hi, f"{bd.side}: {bd.label}", brs_all))
+
+    for bd in bounds:
+        if bd.lo < 1:
+            continue
+        z_branches = []          # (root, term name, candidate container idxs)
+        ok = True
+        for t in bd.terms:
+            brs = _leaf_branches(t)
+            if brs is None:
+                ok = False
+                break
+            for r, exprs, names in brs:
+                conj = _flatten_conjuncts(exprs)
+                cands = [ci for ci, (_c, _l, cbrs) in enumerate(containers)
+                         if any(xr == r and all(_branch_implies(conj, names, req, xn)
+                                                for req in xconj)
+                                for xr, xconj, xn in cbrs)]
+                if not cands:
+                    ok = False
+                    break
+                z_branches.append((r, t.name, cands))
+            if not ok:
+                break
+        if not ok:
+            continue
+
+        def cost(assign):
+            per: Dict[int, Dict[str, int]] = {}
+            for (r, _n, _c), ci in zip(z_branches, assign):
+                per.setdefault(ci, {}).setdefault(r, 0)
+                per[ci][r] += 1
+            return sum(containers[ci][0] * max(cnt.values()) for ci, cnt in per.items())
+
+        # Exhaustive search over assignments (branch counts are tiny);
+        # greedy cheapest-candidate fallback beyond the cap.
+        n_combo = 1
+        for _r, _n, c in z_branches:
+            n_combo *= len(c)
+        if n_combo <= 4096:
+            import itertools
+            best = min(itertools.product(*[c for _r, _n, c in z_branches]), key=cost)
+        else:
+            best = tuple(min(c, key=lambda ci: containers[ci][0]) for _r, _n, c in z_branches)
+        total = cost(best)
+        if total < bd.lo:
+            used = [f"{r} branch of {n} ⊆ ({containers[ci][1]}, ≤ {_fmt(containers[ci][0])})"
+                    for (r, n, _c), ci in zip(z_branches, best)]
+            return (f"Cardinality bound: {bd.side}: {bd.label} needs ≥ {_fmt(bd.lo)}, "
+                    f"but the other cuts allow at most {_fmt(total)} — "
+                    + "; ".join(used) + ". No event can pass both regions.")
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Region-pair comparison  (Rules 1, 2, 3, 4)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1887,6 +2237,21 @@ def _check_region_pair(
     informational = [cp for cp in cut_pair_results if cp.informational_only]
     contribs = [cp.verdict for cp in aggregating]
     verdict = _combine(contribs) if contribs else OVERLAP
+
+    # Rule 2b: the per-variable pairing can't combine cuts across
+    # differently-named objects or decompose Union objects; try the
+    # cardinality-bound proof. It only ever adds a (sound) DISJOINT.
+    if verdict != DISJOINT:
+        proof = _prove_cardinality_disjoint(reg_a, reg_b)
+        if proof is not None:
+            cp = CutPairResult(
+                surface_a=set(), surface_b=set(),
+                structure_matched=True, dep_values_matched=True,
+                verdict=DISJOINT, notes=[proof],
+            )
+            cut_pair_results.append(cp)
+            aggregating.append(cp)
+            verdict = DISJOINT
 
     notes: List[str] = []
     by_v: Dict[str, int] = {}
@@ -2010,9 +2375,10 @@ def _check_object_pair_for_report(
 def _all_builtins_in_ir(ir: AnalysisIR) -> Set[str]:
     builtins: Set[str] = set()
     for obj in ir.objects.values():
-        root = obj.root_type()
-        if root != "UNKNOWN":
-            builtins.add(root)
+        # All roots, not ``root_type()``'s single representative: a Union
+        # object spans several built-in collections.
+        if obj.chain is not None:
+            builtins |= obj.chain.roots()
     for reg in ir.regions.values():
         builtins |= reg.all_builtin_objects()
     return builtins
