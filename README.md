@@ -1,4 +1,4 @@
-# CutLang ADL Overlap Analyzer
+# ADL Overlap Analyzer
 
 ## Building
 
