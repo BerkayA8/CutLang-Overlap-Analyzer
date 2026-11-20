@@ -1858,6 +1858,51 @@ def _compare_region_variables(
                     tree_b=rc_b.dependency_tree,
                 ))
 
+    # Identical compound cuts (no top-level signature, e.g. an OR of
+    # conditions) on both sides: the same condition, so EQUAL. Only for
+    # expressions whose names cannot mean different things in the two
+    # analyses: built-ins, MET, and the file-unique names of the formal-ADL
+    # front end (o<hash>_..., opq_<hash>_...).
+    import json as _json, re as _re
+    def _safe_key(rc):
+        if rc.raw_expr is None:
+            return None
+        ids = []
+        def walk(n):
+            if isinstance(n, dict):
+                if n.get("tok") == "ID":
+                    ids.append(n.get("id", ""))
+                for v in n.values():
+                    walk(v)
+            elif isinstance(n, list):
+                for v in n:
+                    walk(v)
+        walk(rc.raw_expr)
+        from ir_extractor import BUILTIN_OBJECTS as _B
+        if not all(i.upper() in _B or _re.match(r"^(o|opq_)[0-9a-f]{8}_", i) for i in ids):
+            return None
+        return (rc.command, _json.dumps(rc.raw_expr, sort_keys=True))
+    keys_b = {}
+    for rc in unsigned_b:
+        k = _safe_key(rc)
+        if k is not None:
+            keys_b.setdefault(k, []).append(rc)
+    still_a = []
+    for rc in unsigned_a:
+        k = _safe_key(rc)
+        if k is not None and keys_b.get(k):
+            rb = keys_b[k].pop()
+            unsigned_b.remove(rb)
+            cut_pair_results.append(CutPairResult(
+                surface_a=rc.surface_vars, surface_b=rb.surface_vars,
+                structure_matched=True, dep_values_matched=True,
+                verdict=EQUAL, notes=["Identical compound cut on both sides → EQUAL."],
+                tree_a=rc.dependency_tree, tree_b=rb.dependency_tree,
+            ))
+        else:
+            still_a.append(rc)
+    unsigned_a = still_a
+
     for rc in unsigned_a:
         # Same chi-square override for cuts that produced no top-level
         # signature at all.
@@ -2359,8 +2404,11 @@ def _check_region_pair(
 ) -> RegionPairResult:
     shared_builtins = reg_a.all_builtin_objects() & reg_b.all_builtin_objects()
 
-    # Rule 1
-    if not shared_builtins:
+    # Rule 1 is not applied: regions that read different collections (a
+    # photon region and a jet region, or a region that only cuts on event
+    # inputs) can still select the same event. Without shared collections
+    # nothing can be proven, and the comparison below gives OVERLAP.
+    if False:
         return RegionPairResult(
             region_a=name_a, region_b=name_b,
             analysis_a=ir_a.source_file, analysis_b=ir_b.source_file,
@@ -2535,7 +2583,10 @@ def _all_builtins_in_ir(ir: AnalysisIR) -> Set[str]:
 
 def compare(
     ir_a: AnalysisIR, ir_b: AnalysisIR,
+    regions_a: Optional[Set[str]] = None,
 ) -> OverlapReport:
+    """regions_a: if given, only these regions of A are compared (with every
+    region of B), and the object-pair report is skipped."""
     import expr_node as _en
     from object_containment import ObjectProver
     global _PROVER
@@ -2543,7 +2594,7 @@ def compare(
     _PROVER = ObjectProver(ir_a, ir_b)
     try:
         _en.SRC_OBJECT_ALIASES.update(_equal_object_aliases(ir_a, ir_b))
-        return _compare_impl(ir_a, ir_b)
+        return _compare_impl(ir_a, ir_b, regions_a)
     finally:
         _en.SRC_OBJECT_ALIASES.clear()
         _PROVER = None
@@ -2592,6 +2643,7 @@ def _equal_object_aliases(ir_a: AnalysisIR, ir_b: AnalysisIR) -> Dict[str, str]:
 
 def _compare_impl(
     ir_a: AnalysisIR, ir_b: AnalysisIR,
+    regions_a: Optional[Set[str]] = None,
 ) -> OverlapReport:
     report = OverlapReport(analysis_a=ir_a.source_file, analysis_b=ir_b.source_file)
 
@@ -2599,7 +2651,7 @@ def _compare_impl(
     builtins_b = _all_builtins_in_ir(ir_b)
     no_shared_builtins = not (builtins_a & builtins_b)
 
-    for obj_a in ir_a.objects.values():
+    for obj_a in (ir_a.objects.values() if regions_a is None else []):
         for obj_b in ir_b.objects.values():
             if obj_a.root_type() == "UNKNOWN" or obj_b.root_type() == "UNKNOWN":
                 continue
@@ -2609,6 +2661,11 @@ def _compare_impl(
                 _check_object_pair_for_report(obj_a, ir_a, obj_b, ir_b)
             )
 
+    # Rule 1 ("no shared built-in collections -> DISJOINT") is not used: two
+    # analyses that read different collections can select the same event
+    # (a photon search and a jet search, say). The regions are compared
+    # normally, which gives OVERLAP when nothing else can be proven.
+    no_shared_builtins = False
     if no_shared_builtins:
         for name_a, reg_a in ir_a.regions.items():
             for name_b, reg_b in ir_b.regions.items():
@@ -2623,6 +2680,8 @@ def _compare_impl(
                 ))
     else:
         for name_a, reg_a in ir_a.regions.items():
+            if regions_a is not None and name_a not in regions_a:
+                continue
             for name_b, reg_b in ir_b.regions.items():
                 report.region_results.append(
                     _check_region_pair(reg_a, name_a, reg_b, name_b, ir_a, ir_b)

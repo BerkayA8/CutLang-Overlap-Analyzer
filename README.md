@@ -72,6 +72,31 @@ The binary `Overlap_pipeline/adl_to_json` is found automatically when the script
 export ADL_TO_JSON=/path/to/adl_to_json
 ```
 
+### Formal ADL files
+
+Files in the formal ADL syntax of [learn-adl](https://github.com/ADL4HEP/learn-adl) (`object ... take ...`, `region ... select ...`, `reject`, `[]` ranges, `union`, `sort`, ...) are recognised automatically and read by `Overlap_pipeline/formal_adl.py`, which lowers them to the same JSON tree that `adl_to_json` produces. Both syntaxes can be mixed in one comparison.
+
+Constructs that cannot be expressed as intervals (composites, RestFrames, mT2, BDT/ONNX scores and the other ADL-proposal functions, slices, ...) become opaque cuts with a name unique to the file and the expression. An opaque cut is only ever matched with the identical cut of the same file, so no verdict is ever derived from it: results stay sound and only become less specific.
+
+### Comparing selected regions only
+
+From Python, `compare()` takes an optional set of region names of the first analysis. Only those regions are compared, with every region of the second analysis, which is much faster when one region is checked against a large set of analyses:
+
+```python
+from cpp_parser_bridge import load_adl_file_cpp
+from overlap_checker import compare
+
+a = load_adl_file_cpp("ANA-SUSY-2018-16.adl")
+b = load_adl_file_cpp("ANA-SUSY-2016-25.adl")
+rep = compare(a, b, regions_a={"SR_E_med_iMLLf", "SR_E_low_iMLLf"})
+for r in rep.region_results:
+    print(r.region_a, r.region_b, r.verdict)
+```
+
+### Regions that read different collections
+
+Two regions that use no common built-in collection (a photon region and a jet region, or a region that only cuts on event-level inputs) are no longer declared DISJOINT: such regions can still select the same event. They are compared normally, which gives OVERLAP unless something else can be proven.
+
 ---
 
 ## Example: self-comparison of published ATLAS analyses

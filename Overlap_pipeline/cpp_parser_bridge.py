@@ -172,6 +172,11 @@ def load_adl_file_cpp(adl_path: str):
     Parse with the C++ binary and return a fully-populated AnalysisIR.
     """
     from ir_extractor import extract_ir
+    from formal_adl import is_formal_adl, parse_formal_file
+    with open(adl_path, encoding="utf-8") as fh:
+        if is_formal_adl(fh.read()):
+            nodes, _ = parse_formal_file(adl_path)
+            return extract_ir(nodes, source_file=adl_path)
     return extract_ir(parse_adl_file_cpp(adl_path), source_file=adl_path)
 
 
